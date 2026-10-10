@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+if("@CMAKE_SYSTEM_NAME@" STREQUAL "Linux" AND @ALLY_AUDIO_ALSA@)
+    find_dependency(ALSA)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/AllyAudioTargets.cmake")

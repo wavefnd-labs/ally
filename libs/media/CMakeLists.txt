@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.25)
+project(AllyMedia VERSION 0.1.0 LANGUAGES C CXX)
+include(CTest)
+add_library(ally_media src/container/wav.cpp)
+add_library(Ally::Media ALIAS ally_media)
+target_compile_features(ally_media PUBLIC cxx_std_23)
+target_include_directories(ally_media PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+if(BUILD_TESTING)
+    add_executable(media_tests tests/wav_tests.cpp)
+    target_link_libraries(media_tests PRIVATE Ally::Media)
+    add_test(NAME media.wav COMMAND media_tests)
+endif()
+install(TARGETS ally_media EXPORT AllyMediaTargets ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+install(DIRECTORY include/ DESTINATION include)
+install(EXPORT AllyMediaTargets NAMESPACE Ally:: DESTINATION lib/cmake/AllyMedia)
+set_target_properties(ally_media PROPERTIES EXPORT_NAME Media)
+include(CMakePackageConfigHelpers)
+configure_package_config_file(cmake/AllyMediaConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/AllyMediaConfig.cmake" INSTALL_DESTINATION lib/cmake/AllyMedia)
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/AllyMediaConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/AllyMediaConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/AllyMediaConfigVersion.cmake" DESTINATION lib/cmake/AllyMedia)
