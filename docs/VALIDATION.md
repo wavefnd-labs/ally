@@ -15,9 +15,9 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 | 검사 | 결과 |
 |---|---|
 | Debug / Release 전체 빌드 | 성공, 자체 소스 warning/error 없음 |
-| Debug CTest | 8/8 통과, 11.18초 |
-| Release CTest | 8/8 통과, 0.88초 |
-| ASan / UBSan / LeakSanitizer | 8/8 통과, 36.06초, 샌드박스 밖 실행 |
+| Debug CTest | 8/8 통과, 12.51초 |
+| Release CTest | 8/8 통과, 1.02초 |
+| ASan / UBSan / LeakSanitizer | 8/8 통과, 37.51초, 샌드박스 밖 실행 |
 | 독립 Audio GCC Release / CTest | 성공, 4/4 통과 |
 | 독립 Media GCC Release / CTest | 성공, 1/1 통과 |
 | Release GUI smoke 1440×900 / 870×650 | 실제 NVIDIA GL, 두 크기 모두 통과 |
@@ -43,7 +43,7 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 
 ## 플랫폼·패키지 검증
 
-이전 native SDK CI는 [이 실행](https://github.com/wavefnd-labs/ally/actions/runs/38108195208)에서 Linux/Windows/macOS 코어 6/6·독립 Audio 3/3·Media 1/1 및 sanitizer 6/6을 통과했습니다. 이번 capture·production 경로의 CI 결과는 아래 최종 기록에 별도로 추가합니다.
+최종 구현 커밋 `854210d`의 [native SDK CI](https://github.com/wavefnd-labs/ally/actions/runs/38111232917)는 네 작업 모두 성공했습니다. Ubuntu 24.04·Windows Server 2022/MSVC·macOS 14 각각 코어 8/8·독립 Audio 4/4·Media 1/1을 통과했고 Linux sanitizer도 8/8을 통과했습니다. Windows 코어는 9.94초, macOS 코어는 6.16초였습니다. Windows production의 파일 핸들 정리와 프로젝트 테스트의 큰 Plan 스택 문제를 수정한 뒤 재검증한 결과입니다. MSVC는 false sharing 방지 `alignas(64)`의 의도된 padding에 C4324 경고를 보고하며, 다른 자체 소스 경고는 확인되지 않았습니다.
 
 WASAPI capture를 포함한 MinGW 독립 오디오 크로스 빌드/링크는 통과했습니다. Windows 실행, Apple HAL 실제 하드웨어와 SDL3/Skia 전체 GUI는 해당 OS에서 아직 검증하지 않았습니다. CI의 native backend 검사는 실제 SDK 빌드와 장치 없는 invalid-config/stop 계약을 검사하며 physical I/O를 대신하지 않습니다.
 
@@ -51,6 +51,8 @@ libsoxr 0.1.3 generic C dispatch의 Clang function-pointer 타입 검사만 해�
 
 ## 발견한 문제와 한계
 
+- 입력 시작 실패 후 0프레임 WAV가 남아 같은 위치의 재녹음을 막던 문제를 수정했습니다. 존재하지 않는 장치로 실패한 뒤 같은 경로에서 실제 입력으로 29,696프레임을 녹음/import한 검사를 통과했습니다(큐 손실 0, 출력 xrun 0).
+- Windows production 테스트는 스트림 핸들을 해제한 뒤 파일을 정리하도록 수정했습니다. 프로젝트 회귀 테스트의 여러 큰 Plan이 Windows 기본 스택에 쌓여 segmentation fault가 발생한 문제도 helper/heap 보관으로 수정했습니다. MinGW -O0 stack-usage에서 main frame은 839,984→18,944 bytes로 줄었습니다.
 - 기본 Linux capture PCM이 ENOENT로 열리지 않는 환경에서 실제 PipeWire source를 열거해 명시적으로 선택하도록 연결했습니다. 직접 PipeWire/JACK callback backend는 아직 없습니다.
 - stream worker가 이미 준비된 슬롯을 반복해서 writing으로 전환하여 RT miss를 만들던 문제를 수정했습니다. seek·동시 먼 offset·디스크 지연에서 miss가 날 수 있으며 miss 프레임 수를 표시하고 무음으로 처리합니다.
 - 긴 WAV sample-rate 변환은 선형 보간입니다. libsoxr continuous HQ streaming·진행/취소·정밀 캐시 scheduling은 다음 작업입니다.
