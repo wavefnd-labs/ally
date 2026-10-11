@@ -20,7 +20,7 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 | ASan / UBSan / LeakSanitizer | 8/8 통과, 37.51초, 샌드박스 밖 실행 |
 | 독립 Audio GCC Release / CTest | 성공, 4/4 통과 |
 | 독립 Media GCC Release / CTest | 성공, 1/1 통과 |
-| Release GUI smoke 1440×900 / 870×650 | 실제 NVIDIA GL, 두 크기 모두 통과 |
+| Release GUI smoke 1440×900 / 870×650 | 실제 NVIDIA GL, 두 크기 교대로 10/10 통과. Debug 870×650도 통과 |
 | 실제 native audio record→WAV→track clip | 29,440프레임, 녹음 큐 손실 0, 48 kHz stereo WAV 검사 통과 |
 | 녹음 probe 중 출력 | 85,248프레임 처리, buffer 256, xrun 0, 최대 process 0.217461 ms |
 | Mixer 실제 재생 | peak 0.265195, 173,056프레임 처리, xrun 0, 최대 process 0.313373 ms |
@@ -43,7 +43,7 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 
 ## 플랫폼·패키지 검증
 
-최종 구현 커밋 `854210d`의 [native SDK CI](https://github.com/wavefnd-labs/ally/actions/runs/38111232917)는 네 작업 모두 성공했습니다. Ubuntu 24.04·Windows Server 2022/MSVC·macOS 14 각각 코어 8/8·독립 Audio 4/4·Media 1/1을 통과했고 Linux sanitizer도 8/8을 통과했습니다. Windows 코어는 9.94초, macOS 코어는 6.16초였습니다. Windows production의 파일 핸들 정리와 프로젝트 테스트의 큰 Plan 스택 문제를 수정한 뒤 재검증한 결과입니다. MSVC는 false sharing 방지 `alignas(64)`의 의도된 padding에 C4324 경고를 보고하며, 다른 자체 소스 경고는 확인되지 않았습니다.
+최종 구현 커밋 `7a25e50`의 [native SDK CI](https://github.com/wavefnd-labs/ally/actions/runs/38111600208)는 네 작업 모두 성공했습니다. Ubuntu 24.04·Windows Server 2022/MSVC·macOS 14 각각 코어 8/8·독립 Audio 4/4·Media 1/1을 통과했고 Linux sanitizer도 8/8을 통과했습니다. Windows/MSVC와 Apple SDK 빌드 및 모든 코어 회귀 검사를 통과했습니다. Windows production의 파일 핸들 정리와 프로젝트 테스트의 큰 Plan 스택 문제를 수정한 뒤 재검증한 결과입니다. MSVC는 false sharing 방지 `alignas(64)`의 의도된 padding에 C4324 경고를 보고하며, 다른 자체 소스 경고는 확인되지 않았습니다.
 
 WASAPI capture를 포함한 MinGW 독립 오디오 크로스 빌드/링크는 통과했습니다. Windows 실행, Apple HAL 실제 하드웨어와 SDL3/Skia 전체 GUI는 해당 OS에서 아직 검증하지 않았습니다. CI의 native backend 검사는 실제 SDK 빌드와 장치 없는 invalid-config/stop 계약을 검사하며 physical I/O를 대신하지 않습니다.
 
@@ -52,6 +52,7 @@ libsoxr 0.1.3 generic C dispatch의 Clang function-pointer 타입 검사만 해�
 ## 발견한 문제와 한계
 
 - 입력 시작 실패 후 0프레임 WAV가 남아 같은 위치의 재녹음을 막던 문제를 수정했습니다. 존재하지 않는 장치로 실패한 뒤 같은 경로에서 실제 입력으로 29,696프레임을 녹음/import한 검사를 통과했습니다(큐 손실 0, 출력 xrun 0).
+- 마지막 package smoke에서 키보드 검증이 한 번 실패했습니다. window ID/scancode/down이 완전한 SDL 이벤트를 주입하고 고정 frame의 재생 여부 대신 실제 event dispatch 직후 transport 변화로 검증하도록 수정했습니다. 두 창 크기의 Release GPU smoke를 교대로 10회 실행해 모두 통과했고 Debug도 통과했습니다.
 - Windows production 테스트는 스트림 핸들을 해제한 뒤 파일을 정리하도록 수정했습니다. 프로젝트 회귀 테스트의 여러 큰 Plan이 Windows 기본 스택에 쌓여 segmentation fault가 발생한 문제도 helper/heap 보관으로 수정했습니다. MinGW -O0 stack-usage에서 main frame은 839,984→18,944 bytes로 줄었습니다.
 - 기본 Linux capture PCM이 ENOENT로 열리지 않는 환경에서 실제 PipeWire source를 열거해 명시적으로 선택하도록 연결했습니다. 직접 PipeWire/JACK callback backend는 아직 없습니다.
 - stream worker가 이미 준비된 슬롯을 반복해서 writing으로 전환하여 RT miss를 만들던 문제를 수정했습니다. seek·동시 먼 offset·디스크 지연에서 miss가 날 수 있으며 miss 프레임 수를 표시하고 무음으로 처리합니다.
