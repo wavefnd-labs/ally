@@ -353,16 +353,8 @@ int main(int argc, char **argv) {
             recorder.monitor(workspace.monitoring ? workspace.selectedTrack() : -1,
                              workspace.selectedInputChannel());
             if (workspace.monitoring) {
-                takeStartFrame = engine.position();
-                takeStartClock = engine.timestamp();
-                takeGraphLatency = ally::audio::planLatencyFrames(project.compile(engine.sampleRate()));
-                takeOutputLatency = backend->stats().outputLatencyMs;
-                workspace.audioRecordingState(true);
-                engine.play(true);
                 std::string error;
                 if (!input->start(recorder, workspace.inputConfig, error)) {
-                    workspace.audioRecordingState(false);
-                    engine.play(false);
                     workspace.monitoring = false;
                     recorder.monitor(-1);
                     workspace.status = "Input unavailable: " + error;
@@ -395,7 +387,6 @@ int main(int argc, char **argv) {
                 engine.play(false);
                 try {
                     auto files = recorder.finish();
-                    engine.play(false);
                     if (recorder.capturedFrames() && recorder.firstCaptureClock() != UINT64_MAX) {
                         const auto start = ally::recordingStartFrame(
                             takeStartFrame, takeStartClock, recorder.firstCaptureClock(),
@@ -493,6 +484,19 @@ int main(int argc, char **argv) {
             if (offline || (!recordSeconds && frameLimit && frameLimit < 50)) {
                 throw std::runtime_error("Record probe requires native audio and either --record-seconds, "
                                          "automatic completion, or --frames >= 50");
+            }
+            const bool playingBeforeMonitor = engine.playing();
+            workspace.requestMonitor();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!workspace.monitoring || workspace.recordingAudio ||
+                engine.playing() != playingBeforeMonitor || !input->stats().processedFrames) {
+                throw std::runtime_error("Monitor must capture without starting transport or a take: " +
+                                         workspace.status);
+            }
+            workspace.requestMonitor();
+            if (workspace.monitoring || workspace.recordingAudio ||
+                engine.playing() != playingBeforeMonitor) {
+                throw std::runtime_error("Monitor shutdown changed recording or transport state");
             }
             workspace.action("arm0");
             workspace.action("record");
