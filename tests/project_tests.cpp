@@ -13,6 +13,12 @@
             throw std::runtime_error(#x);                                                                    \
         }                                                                                                    \
     } while (false)
+std::unique_ptr<ally::audio::Plan> compilePlan(const ally::Project &project) {
+    auto plan = std::make_unique<ally::audio::Plan>();
+    *plan = project.compile(48000);
+    return plan;
+}
+
 int main() {
     auto p = ally::Project::demo();
     CHECK(p.valid());
@@ -25,32 +31,32 @@ int main() {
     CHECK(q == p);
     CHECK(q.bpm == p.bpm);
     p.tracks[1].solo = true;
-    auto solo = p.compile(48000);
-    CHECK(solo.gains[0] == 0 && solo.gains[1] > 0 && solo.gains[2] == 0);
+    auto solo = compilePlan(p);
+    CHECK(solo->gains[0] == 0 && solo->gains[1] > 0 && solo->gains[2] == 0);
     p.save(root / "solo.ally");
     CHECK(ally::Project::load(root / "solo.ally").tracks[1].solo);
     p.tracks[1].solo = false;
-    auto plan = p.compile(48000);
-    CHECK(plan.loopFrames == 743226 && plan.loopEndFrame == 557419 && plan.count == 108);
-    CHECK(plan.sampleCount == 1 && plan.samples[0].track == 3);
-    CHECK(plan.samples[0].start == 92903 && plan.samples[0].duration == 557420);
+    auto plan = compilePlan(p);
+    CHECK(plan->loopFrames == 743226 && plan->loopEndFrame == 557419 && plan->count == 108);
+    CHECK(plan->sampleCount == 1 && plan->samples[0].track == 3);
+    CHECK(plan->samples[0].start == 92903 && plan->samples[0].duration == 557420);
     CHECK(q.songMode && q.tracks[1].clips == p.tracks[1].clips);
-    for (uint32_t i = 1; i < plan.count; ++i) {
-        CHECK(plan.notes[i - 1].start <= plan.notes[i].start);
+    for (uint32_t i = 1; i < plan->count; ++i) {
+        CHECK(plan->notes[i - 1].start <= plan->notes[i].start);
     }
     CHECK(p.tracks.size() == 5);
     // The long Keys clip repeats its pattern, followed by an octave variation.
     auto has = [&](uint8_t key, uint64_t start) {
-        return std::any_of(plan.notes.begin(), plan.notes.begin() + plan.count,
+        return std::any_of(plan->notes.begin(), plan->notes.begin() + plan->count,
                            [&](const auto &n) { return n.track == 0 && n.key == key && n.start == start; });
     };
     CHECK(has(60, 0) && has(60, 92903) && has(72, 371613));
     p.tracks[1].clips.clear();
-    CHECK(p.compile(48000).count == 84);
+    CHECK(compilePlan(p)->count == 84);
     p = q;
     p.songMode = false;
-    CHECK(p.compile(48000).count == 20 && p.compile(48000).loopFrames == 92903);
-    CHECK(p.compile(48000).sampleCount == 0);
+    CHECK(compilePlan(p)->count == 20 && compilePlan(p)->loopFrames == 92903);
+    CHECK(compilePlan(p)->sampleCount == 0);
     p.songMode = true;
     ally::renderProject(p, root / "render.wav");
     auto pcm = ally::media::readWav(root / "render.wav");
@@ -115,10 +121,10 @@ int main() {
         edge.bpm = bpm;
         edge.tracks[3].clips[0].beat = 1.25;
         edge.tracks[3].clips[0].length = 30.75;
-        auto rounded = edge.compile(48000);
-        CHECK(rounded.samples[0].start + rounded.samples[0].duration == rounded.loopFrames);
+        auto rounded = compilePlan(edge);
+        CHECK(rounded->samples[0].start + rounded->samples[0].duration == rounded->loopFrames);
         ally::audio::Engine engine;
-        CHECK(engine.submit(rounded));
+        CHECK(engine.submit(*rounded));
     }
     p.bpm = 0;
     CHECK(!p.valid());
