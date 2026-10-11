@@ -403,7 +403,13 @@ int main(int argc, char **argv) {
                 recorder.start(std::move(routes));
                 std::string error;
                 if (!input->start(recorder, workspace.inputConfig, error)) {
-                    recorder.finish();
+                    const auto unused = recorder.finish();
+                    for (const auto &file : unused) {
+                        if (!file.frames) {
+                            std::error_code cleanupError;
+                            std::filesystem::remove(file.path, cleanupError);
+                        }
+                    }
                     throw std::runtime_error("Native input failed: " + error);
                 }
                 takeStartBeat = double(engine.position()) / (engine.sampleRate() * 60 / project.bpm);
