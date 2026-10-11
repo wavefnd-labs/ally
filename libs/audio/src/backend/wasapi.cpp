@@ -1,15 +1,18 @@
 #define NOMINMAX
+#include <windows.h>
+
 #include <algorithm>
 #include <ally/audio/backend.hpp>
 #include <ally/audio/engine.hpp>
 #include <atomic>
 #include <audioclient.h>
 #include <chrono>
+#include <propkeydef.h>
+
 #include <functiondiscoverykeys_devpkey.h>
 #include <future>
 #include <mmdeviceapi.h>
 #include <thread>
-#include <windows.h>
 namespace ally::audio {
 namespace {
 template <class T> struct ComPtr {

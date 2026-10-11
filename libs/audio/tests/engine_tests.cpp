@@ -223,7 +223,7 @@ int main() {
         CHECK(dark.peak() < bright.peak() * .15f);
     }
     SpscQueue<uint64_t, 128> queue;
-    std::jthread producer([&] {
+    std::thread producer([&] {
         for (uint64_t i = 0; i < 100000; ++i) {
             while (!queue.push(i)) {
                 std::this_thread::yield();
@@ -237,5 +237,6 @@ int main() {
         }
         CHECK(value == i);
     }
+    producer.join();
     std::cout << "sample boundaries, transport, live notes, validation and 100000 SPSC transfers passed\n";
 }
