@@ -61,3 +61,27 @@ Windows/macOS 실행·네이티브 출력, 실제 MIDI 장치, 장시간 부하/
 앱 내부 창 버튼과 borderless/caption 구현을 제거했습니다. Linux libdecor 개발 파일이 없는 환경에서 X11/XWayland의 OS 창 장식을 사용합니다. 실제 NVIDIA GL/ALSA 실행에서 SDL_GetWindowBordersSize가 native title bar 37px를 반환했습니다. OS close-request 이벤트의 종료 경로와 최소 870×650 GUI smoke를 통과했습니다. 창 장식은 Skia framebuffer 밖에 있으므로 기존 내용 영역 PNG에는 OS 제목 표시줄이 포함되지 않습니다.
 
 X11 검증에서 발견한 Skia GL 함수 연결의 실패도 수정했습니다. GLX resolver가 EGL 함수 이름에 잘못된 dispatch stub을 반환할 수 있어 GL entry point만 공급합니다. 수정 후 X11과 Wayland의 실제 GPU 실행을 확인했습니다. OS 버튼의 배치는 시스템 설정에 따르며 전역 OS 설정은 변경하지 않습니다.
+
+## 2026-10-11: 네 가지 기능 확장
+
+독립 패턴, WAV 소스, 문서 저장/복구, native desktop 오디오 및 CI를 추가했습니다. 상단의 4개 테스트 기록은 이전 구현의 결과이며 이번 확장 결과는 아래와 구분합니다. images/workspace.png·devices.png·mixer.png는 이번 네이티브 실행 화면으로 갱신했습니다.
+
+| 검사 | 실제 결과 |
+|---|---|
+| Linux Debug/Release CTest | 각각 6/6 통과 |
+| ASan/UBSan/LeakSanitizer | 샌드박스 밖에서 6/6 통과; libsoxr만 함수 타입 검사 제외 |
+| GUI smoke 1440×900·870×650 | 실제 Skia GL hit target의 기존 편집 + 패턴 복제/할당/이름 변경 + WAV import/trim/loop + worker 저장/열기/export + 오디오 설정 통과 |
+| 문서 회귀 | 독립 패턴·v4 변환, WAV 44.1→48 kHz, trim/one-shot/loop, 상대 경로 이동·누락·변경·relink, 기존 파일 atomic 교체, 실패 후 원본 보존, 자동 저장/복원, OS lease 통과 |
+| RT 소스 소유권 | 원본 shared pointer 해제 후 PCM 처리, 미등록 span 거절, process heap 할당 금지 검사 통과 |
+| 실제 ALSA buffer 전환 | 128/512/256 요청 및 실제 period 일치; 출력 활성·processed frames 증가, 각각 xrun 0 |
+| 실제 GPU/오디오 실행 | NVIDIA RTX 2060, ALSA default, native OS title bar 37px; mixer 재생 peak 0.143048, processed 52480 frames, buffer 256, 지연 추정 21.3333 ms, xrun 0, process max 0.202783 ms |
+| Windows 크로스 빌드 | MinGW 전체 독립 오디오 및 C/C++ 소비자 실행파일 링크 성공; Windows 실행은 해당 CI로 별도 검사 |
+| OS별 GitHub Actions | [성공 실행](https://github.com/wavefnd-labs/ally/actions/runs/38107862267): Ubuntu 24.04, Windows Server 2022/MSVC, macOS 14 각각 코어 6/6·독립 Audio 3/3·Media 1/1; Linux sanitizer 6/6 |
+| SDK 설치 | 설치된 AllyAudio의 Audio/Resampler/Soxr와 AllyMedia를 사용하는 외부 CMake 소비자 빌드 및 변환/PCM 검사 통과 |
+| CPack | 변경된 native app·독립 라이브러리·libsoxr 라이선스를 포함한 Linux ZIP 생성 |
+
+첫 CI에서 MSVC property-key 헤더 include 순서와 Apple libc++의 std::jthread 테스트 지원 문제를 발견했습니다. 명시적인 SDK include 경계 및 join하는 std::thread 테스트로 수정한 후 모든 OS가 통과했습니다. Core Audio/WASAPI 타깃은 실제 SDK로 컴파일되지만 CI의 backend 검사는 장치 없는 invalid-config/stop 경로입니다. Windows/macOS 실제 스피커 출력·장치 변경·전체 SDL3/Skia GUI와 OS 파일 선택기의 사람 조작은 아직 검증하지 않았습니다.
+
+libsoxr 0.1.3 generic C dispatch는 Clang function-pointer 타입 검사에서 오류를 보고합니다. 이 검사는 libsoxr 타깃에만 제외하고 ASan 및 나머지 UBSan과 Ally 코드를 유지했습니다. 샌드박스의 ptrace 제한 때문에 최초 LeakSanitizer 실행은 실패했으며, 제한 밖의 실제 누수 검사는 통과했습니다.
+
+WASAPI xrun 값은 관측한 shared-buffer starvation, Core Audio 값은 processor-overload 알림, ALSA 값은 EPIPE/ESTRPIPE 복구 횟수입니다. UI의 latency는 backend 추정값이며 오디오 loopback으로 측정한 round-trip latency가 아닙니다. 짧은 출력 검사의 xrun 0은 장시간 안정성을 증명하지 않습니다.

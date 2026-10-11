@@ -95,7 +95,7 @@ class Workspace {
     std::vector<ClipHit> clips_;
     std::vector<Project> undo_, redo_;
     std::optional<Project> before_;
-    Rect hitClip_{}, grid_{}, velocity_{}, lanes_{}, divider_{}, tempo_{}, searchBox_{};
+    Rect hitClip_{}, grid_{}, velocity_{}, lanes_{}, divider_{}, tempo_{}, searchBox_{}, menuRect_{};
     std::array<Rect, audio::Plan::maxTracks + 1> faders_{};
     Detail detail_ = Detail::Piano;
     Focus focus_ = Focus::None;

@@ -17,3 +17,5 @@ RF64/ds64, AIFF/AIFC, WAVE_FORMAT_EXTENSIBLE, PCM endian 변환 general API, cha
 ## 다음 설계
 
 seekable byte source와 streaming reader를 분리하고 bounds-checked chunk reader를 공통화합니다. RF64는 64-bit ds64와 chunk table, AIFF는 big-endian FORM/COMM/SSND와 80-bit sample rate를 엄격히 처리합니다. PCM scalar reference kernel에 Highway SIMD를 추가하고 비디오/codec registry를 독립 API로 확장합니다. FFmpeg 의존성은 도입하지 않습니다.
+
+WAV 가져오기와 소스 추적은 Project 계층이 이 독립 decode API를 호출하여 수행합니다. mono/stereo 선택과 libsoxr sample-rate 변환은 준비 단계의 Audio/Project 조합이며 미디어 라이브러리가 UI/문서/오디오 엔진에 의존하지 않습니다. 파일 경로, 누락/변경 검사와 캐시 ownership도 Project 계층에 둡니다.

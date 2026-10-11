@@ -57,7 +57,7 @@ cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build/native
 ```
 
-Windows는 호환 MSVC/clang-cl ABI와 `.lib` 경로가 필요합니다. macOS는 CoreText font manager와 GL Ganesh가 포함되어야 합니다. 전체 GUI의 Windows/macOS 빌드·실행과 실장치 출력은 현재 Linux 환경에서 직접 검증하지 않았습니다. 네이티브 백엔드와 문서 코어는 GitHub Actions에서 해당 OS별로 빌드·테스트합니다. 오프라인 렌더링 코어는 플랫폼 UI에 의존하지 않습니다.
+Windows는 호환 MSVC/clang-cl ABI와 `.lib` 경로가 필요합니다. macOS는 CoreText font manager와 GL Ganesh가 포함되어야 합니다. 전체 GUI의 Windows/macOS 빌드·실행과 실장치 출력은 현재 Linux 환경에서 직접 검증하지 않았습니다. 네이티브 백엔드와 문서 코어는 GitHub Actions의 Linux/Windows/macOS 빌드·테스트를 통과했습니다. 오프라인 렌더링 코어는 플랫폼 UI에 의존하지 않습니다.
 
 ## 독립 모듈 빌드
 
@@ -102,7 +102,7 @@ ctest --test-dir build/media --output-on-failure
 SDL_VIDEODRIVER=offscreen ./build/debug/ally --smoke --screenshot /tmp/workspace.bmp
 ```
 
-`--offline`은 장치 없이 재생 위치를 시뮬레이션하며 소리가 나지 않습니다. GUI도 SDL3/Skia GL로 렌더링합니다. 오디오 장치 개방 실패 시 오류를 표시하고 이 모드로 작동합니다. `--smoke`는 실제 렌더된 hit target으로 노트·velocity·클립 편집, Undo/Redo, 채널·Master fader, cutoff, mute/solo, BPM 입력, 검색, 채널 추가, loop/metronome과 SDL 키보드 재생을 검사합니다. EGL/OpenGL 드라이버가 없는 환경에서는 실패합니다.
+`--offline`은 장치 없이 재생 위치를 시뮬레이션하며 소리가 나지 않습니다. GUI도 SDL3/Skia GL로 렌더링합니다. 오디오 장치 개방 실패 시 오류를 표시하고 이 모드로 작동합니다. `--smoke`는 실제 렌더된 hit target으로 노트·velocity·클립 편집, Undo/Redo, 채널·Master fader, cutoff, mute/solo, BPM 입력, 검색, 채널 추가, loop/metronome·독립 패턴 생성/복제/이름 변경/할당·WAV import/trim/loop·파일 worker save/open/export·오디오 설정과 SDL 키보드 재생을 검사합니다. GUI smoke의 파일 선택 결과는 테스트 경로로 주입하며 OS 파일 선택기의 사람 조작 검증으로 해석하지 않습니다. EGL/OpenGL 드라이버가 없는 환경에서는 실패합니다.
 
 ## 품질과 상태
 

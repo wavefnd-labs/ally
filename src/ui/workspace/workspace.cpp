@@ -256,6 +256,8 @@ void Workspace::fileSelected(const std::string &act, const std::filesystem::path
         return;
     }
     release();
+    focus_ = Focus::None;
+    patternMenu_ = audioMenu_ = false;
     const auto snapshot = project_;
     const auto track = size_t(selected_);
     const auto relink = relinkId_;
@@ -743,12 +745,14 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
 
 void Workspace::menu(SkCanvas &c) {
     if (!patternMenu_ && !audioMenu_) {
+        menuRect_ = {};
         return;
     }
     const float width = std::min(410.0f, width_ - 20);
     const float height = audioMenu_ ? 430 : 370;
     Rect r{width_ - width - 10,
            std::clamp(audioMenu_ ? 60.0f : divider_.y - height, 62.0f, height_ - height - 30), width, height};
+    menuRect_ = r;
     box(c, r, head);
     outline(c, r, 0xff656661);
     hitClip_ = {0, 0, width_, height_};
@@ -1178,8 +1182,19 @@ void Workspace::action(const std::string &act) {
         } else if (act.starts_with("select-pattern:")) {
             auto id = uint32_t(std::stoul(act.substr(15)));
             auto &track = project_.tracks[size_t(selected_)];
-            if (track.findPattern(id)) {
+            if (const auto *pattern = track.findPattern(id)) {
                 track.activePattern = id;
+                if (!pattern->notes.empty()) {
+                    topKey_ = std::clamp(
+                        std::max_element(pattern->notes.begin(), pattern->notes.end(),
+                                         [](const auto &a, const auto &b) { return a.key < b.key; })
+                            ->key,
+                        12, 127);
+                }
+                if (selectedClip_ >= 0 && selectedClip_ < int(track.clips.size()) &&
+                    track.clips[size_t(selectedClip_)].audio) {
+                    selectedClip_ = -1;
+                }
             }
             selectedNote_ = -1;
             patternMenu_ = false;
@@ -1257,6 +1272,10 @@ void Workspace::press(float x, float y, bool right) {
     if (focus_ == Focus::Search && !searchBox_.contains(x, y)) {
         focus_ = Focus::None;
     }
+    if ((patternMenu_ || audioMenu_) && !menuRect_.contains(x, y)) {
+        patternMenu_ = audioMenu_ = false;
+        return;
+    }
     if (divider_.contains(x, y)) {
         dividerDrag_ = true;
         folded_ = false;
@@ -1294,6 +1313,16 @@ void Workspace::press(float x, float y, bool right) {
                 selectedClip_ = int(it->clip);
                 if (!clips[it->clip].audio) {
                     project_.tracks[size_t(track)].activePattern = clips[it->clip].patternId;
+                    const auto &notes = project_.tracks[size_t(track)].pattern().notes;
+                    if (!notes.empty()) {
+                        const int highest =
+                            std::max_element(notes.begin(), notes.end(), [](const auto &a, const auto &b) {
+                                return a.key < b.key;
+                            })->key;
+                        if (highest > topKey_ || highest < topKey_ - 12) {
+                            topKey_ = std::clamp(highest, 12, 127);
+                        }
+                    }
                     dirty_ = true;
                 }
                 before_ = project_;
@@ -1471,6 +1500,9 @@ void Workspace::wheel(float dy, bool pitch, bool pan) {
 }
 
 void Workspace::textInput(const std::string &value) {
+    if (busy()) {
+        return;
+    }
     if (focus_ == Focus::Search) {
         if (search_.size() + value.size() <= 64) {
             search_ += value;
@@ -1495,6 +1527,9 @@ void Workspace::textInput(const std::string &value) {
 }
 
 void Workspace::editKey(const std::string &key) {
+    if (busy()) {
+        return;
+    }
     if (key == "escape") {
         focus_ = Focus::None;
         return;
@@ -1593,6 +1628,15 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     check(project_.tracks[0].findPattern(1)->notes[0].key == 60, "Patterns share edited notes");
     project_.tracks[0].pattern().notes[0].key = 60;
     click("patterns");
+    click("rename-pattern");
+    while (!editText_.empty()) {
+        editKey("backspace");
+    }
+    textInput("Chorus");
+    editKey("enter");
+    check(project_.tracks[0].pattern().name == "Chorus", "Rename pattern failed");
+    click("undo");
+    click("patterns");
     click("assign-pattern");
     check(project_.tracks[0].clips[0].patternId == duplicated, "Pattern assignment failed");
     click("undo");
@@ -1602,6 +1646,7 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     check(project_.tracks[0].pattern().notes.empty(), "New pattern must be empty");
     click("undo");
     action("select-pattern:1");
+    topKey_ = 72;
     redraw();
     const auto count = project_.tracks[0].pattern().notes.size();
     float bw = grid_.w / 4, row = grid_.h / 13;
