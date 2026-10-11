@@ -41,12 +41,19 @@ libsoxr upstream의 C dispatch에는 기존 Clang function-type instrumentation 
 - 실제 DiskStream의 비순차 seek/cache boundary/EOF, 8/44.1/96/384/44.101 kHz. 44.101 kHz에서는 rational phase 주기 이후 먼 탐색도 검사했습니다. 전체 HQ 기준 대비 최대 sample 차이 4.54485e-7; 96 kHz source에는 32 kHz stopband tone을 사용했습니다.
 - 연속 HQ의 96→48 kHz, 32 kHz tone interior RMS 2.82364e-8. stopband suppression을 실제 출력으로 검사했습니다.
 - track/direct/send/연쇄 bus/master를 통과하는 impulse를 120번째 frame 하나로 합쳤으며 동일 bus route+send의 중복 delay 진행을 검사했습니다. seek/rewind 후 이전 delay tail이 사라지고 invalid latency를 거절합니다.
+- 실제 native HQ 재생: 50초 길이 44.1 kHz WAV를 disk stream으로 준비하고 336-sample track/bus PDC를 적용했습니다. 실제 출력 487,424 frames, stream miss 0 / XRUN 0, process max 1.09464 ms, peak .007605를 확인했습니다.
 - offline export는 시작 padding을 제거하고 원래 첫 sample과 timeline frame count를 유지했습니다. 입력 packet/clock·추정 native input/output·PDC·manual offset의 위치 계산, v6→v7와 새 설정 저장/복원을 검사했습니다.
 - Engine::process의 새 룩어헤드/PDC/seek 경로와 기존 DiskStream::read/Recorder::capture에서 operator new 금지 검사를 통과했습니다. worker 할당은 비실시간입니다.
 
 ## 데스크톱 CI와 패키지
 
-현재 변경의 Linux/Windows/macOS native core 및 sanitizer CI 결과, 최종 ZIP 검증은 아래에 완료 후 기록합니다. 전체 Windows/macOS SDL3/Skia GUI·실장치 I/O 검증은 포함하지 않습니다.
+기능 코어 커밋 `00b4f740cc00e2549a65b45fc04def7a7e0a0075`의 [세 OS CI](https://github.com/wavefnd-labs/ally/actions/runs/38133214860)는 Linux/Windows/macOS 각각 core 11/11, independent Audio 4/4, Media 2/2 및 Linux sanitizer 11/11로 통과했습니다. standalone CI의 Audio는 기본 resampler OFF이고 root core에서는 HQ 변환도 검사합니다.
+
+모니터링 연결 회귀 수정 커밋 `35c0b1e22557406e68dbba6f10b3ca49f847de49`는 실제 native input monitor on/off가 transport/recording을 바꾸지 않는 검사를 거친 뒤 29,696프레임을 녹음·가져왔습니다. lost/miss/XRUN 0, process max .40672 ms. 자동 probe는 기존 session recovery를 열거나 autosave를 만들지 않도록 했습니다. 해당 [최종 CI](https://github.com/wavefnd-labs/ally/actions/runs/38133485856)도 세 OS core 각각 11/11, independent Audio 각각 4/4, Media 각각 2/2 및 Linux sanitizer 11/11로 통과했습니다.
+
+Linux ZIP을 생성·압축 해제하고 실행 권한, 870×650 GPU smoke 및 743,226-frame WAV export/inspect를 확인했습니다. 패키지는 생성된 SDK/문서/원본 HTML/의존성 라이선스 원문을 포함하며 최종 검증 기록도 포함합니다.
+
+전체 Windows/macOS SDL3/Skia GUI·실장치 I/O 검증은 포함하지 않습니다.
 
 ## 남은 한계
 
