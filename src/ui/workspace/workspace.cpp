@@ -248,6 +248,16 @@ std::string Workspace::title() const {
 }
 void Workspace::fileSelected(const std::string &act, const std::filesystem::path &path) {
     dialogPending_ = false;
+    if (recordingAudio || recordingMidi) {
+        status = "Stop the take before opening or importing files";
+        return;
+    }
+    if (act == "record-audio") {
+        if (!path.empty() && startAudioTake) {
+            startAudioTake(path);
+        }
+        return;
+    }
     if (path.empty()) {
         status = "Cancelled";
         return;
@@ -257,7 +267,7 @@ void Workspace::fileSelected(const std::string &act, const std::filesystem::path
     }
     release();
     focus_ = Focus::None;
-    patternMenu_ = audioMenu_ = false;
+    patternMenu_ = audioMenu_ = inputMenu_ = midiMenu_ = false;
     const auto snapshot = project_;
     const auto track = size_t(selected_);
     const auto relink = relinkId_;
@@ -272,7 +282,7 @@ void Workspace::fileSelected(const std::string &act, const std::filesystem::path
             for (const auto &clip : result.project.tracks[track].clips) {
                 beat = std::max(beat, clip.beat + clip.length);
             }
-            if (beat >= 32) {
+            if (beat >= Project::maxTimeline) {
                 throw std::runtime_error("Selected track has no room after its clips; choose an empty track");
             }
             result.project.importWav(path, track, beat);
@@ -284,6 +294,52 @@ void Workspace::fileSelected(const std::string &act, const std::filesystem::path
         return result;
     });
     status = "Working: " + act + " " + pathText(path.filename());
+}
+void Workspace::midiMessage(const midi::Message &message) {
+    if (recordingMidi) {
+        try {
+            midiTake_.message(message);
+        } catch (const std::exception &e) {
+            finishMidi();
+            status = e.what();
+        }
+    }
+}
+void Workspace::finishMidi() {
+    if (!recordingMidi) {
+        return;
+    }
+    recordingMidi = false;
+    try {
+        midiTake_.finish(engine_.timestamp());
+        before_ = project_;
+        midiTake_.apply(project_, midiTrack_);
+        commitEdit();
+        changed();
+        status = "MIDI take committed";
+    } catch (const std::exception &e) {
+        before_.reset();
+        status = e.what();
+    }
+}
+void Workspace::recorded(std::vector<RecordedFile> files, double startBeat, uint64_t lostFrames) {
+    if (files.empty()) {
+        status = "No audio captured";
+        return;
+    }
+    const auto snapshot = project_;
+    job_ =
+        std::async(std::launch::async, [snapshot, files = std::move(files), startBeat, lostFrames]() mutable {
+            FileResult result{"recorded", {}, snapshot};
+            result.lostFrames = lostFrames;
+            for (const auto &file : files) {
+                if (file.frames) {
+                    result.project.importWav(file.path, file.track, startBeat);
+                }
+            }
+            return result;
+        });
+    status = "Preparing recorded clips";
 }
 void Workspace::tick(double seconds) {
     if (job_.valid() && job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
@@ -302,6 +358,7 @@ void Workspace::tick(double seconds) {
                     document_.opened(project_, result.path);
                     undo_.clear();
                     redo_.clear();
+                    editing_ = {};
                     selected_ = selectedClip_ = 0;
                 } else if (result.action == "import") {
                     selectedClip_ = int(project_.tracks[size_t(selected_)].clips.size()) - 1;
@@ -310,6 +367,10 @@ void Workspace::tick(double seconds) {
                 changed();
             }
             status = "Completed: " + result.action + " " + pathText(result.path.filename());
+            if (result.lostFrames) {
+                status +=
+                    " / Lost " + std::to_string(result.lostFrames) + " capture frames; silence inserted";
+            }
             auto warnings = project_.sourceWarnings();
             if (!warnings.empty()) {
                 status = "Missing/changed source: " + warnings;
@@ -318,7 +379,7 @@ void Workspace::tick(double seconds) {
             status = error.what();
         }
     }
-    if (!busy()) {
+    if (!busy() && !recordingAudio && !recordingMidi) {
         try {
             if (document_.autosave(project_, seconds)) {
                 status = "Recovery snapshot saved";
@@ -352,7 +413,7 @@ void Workspace::changed() {
     sync();
 }
 bool Workspace::sync() {
-    engine_.looping(project_.loop);
+    engine_.looping(project_.loop && !recordingMidi && !recordingAudio);
     engine_.metronome(project_.metronome);
     if (releaseKey_ >= 0 && engine_.audition({uint8_t(releaseKey_), uint8_t(releaseTrack_), 0})) {
         releaseKey_ = -1;
@@ -413,7 +474,8 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     line(c, 57, 0, 57, 58, 0xff414447);
     tool(c, {71, 14.5, 29, 29}, "@stop", "stop", false, true, "Stop");
     tool(c, {102, 14.5, 29, 29}, engine_.playing() ? "@pause" : "@play", "play", true, true, "Play / Pause");
-    tool(c, {133, 14.5, 29, 29}, "@record", "record", false, false, "Recording is not implemented");
+    tool(c, {133, 14.5, 29, 29}, "@record", "record", recordingAudio || recordingMidi, !busy(),
+         "Record armed audio tracks; Shift+R records MIDI");
     double beat = double(engine_.position()) / (engine_.sampleRate() * 60.0 / project_.bpm);
     char clock[32];
     std::snprintf(clock, sizeof(clock), "%02d.%d.%d", int(beat / 4) + 1, int(std::fmod(beat, 4)) + 1,
@@ -438,7 +500,7 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     x += gap + 1;
     tool(c, {x, 14.5, 29, 29}, "@click", "metronome", project_.metronome, true, "Metronome");
     x += 31;
-    tool(c, {x, 14.5, 29, 29}, "@loop", "loop", project_.loop, true, "Loop bars 1–6");
+    tool(c, {x, 14.5, 29, 29}, "@loop", "loop", project_.loop, true, "Loop configured range");
     x += 29 + gap;
     line(c, x, 15.5, x, 42.5, 0xff414447);
     x += gap + 1;
@@ -468,6 +530,8 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     box(c, {left + 39, 62, 120, 25}, 0xff343638, 2);
     centered(c, "ARRANGEMENT", {left + 39, 62, 120, 25}, 10, 0xffe9e8e0, true);
     tool(c, {left + 162, 62, 84, 25}, "SESSION", "session", false, false, "Session view is not implemented");
+    tool(c, {left + 251, 62, 62, 25}, "+8 bars", "extend-timeline", false,
+         project_.timelineBeats < Project::maxTimeline);
     tool(c, {w - 184, 62, 58, 25}, snap_ == .25 ? "1/16 ⌄" : "1/8 ⌄", "snap", false, true,
          "Grid quantization");
     tool(c, {w - 122, 60, 29, 29}, "@draw", "draw", false, true, erase_ ? "Erase tool" : "Draw tool");
@@ -536,6 +600,10 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
          0xff8f9794);
     buttons_.push_back(
         {{w - 310, bottom, 310, 23}, "audio-settings", "Audio settings / xrun diagnostics", true});
+    if (marquee_) {
+        box(c, selectionBox_, 0x22d8aa70);
+        outline(c, selectionBox_, gold);
+    }
     menu(c);
     if (busy()) {
         box(c, {w / 2 - 170, h / 2 - 22, 340, 44}, head);
@@ -617,22 +685,28 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
     symbol(c, "down", {r.x + 8, r.y + 17, 12, 12}, 0xffa7acab);
     text(c, "TRACKS", r.x + 30, r.y + 27, 10, 0xffa7acab);
     tool(c, {r.x + labelW - 39, r.y + 8, 29, 29}, "＋", "addtrack", false,
-         project_.tracks.size() < audio::Plan::maxTracks, "Add instrument track (up to 8)");
+         project_.tracks.size() < audio::Plan::maxTracks, "Add instrument track (up to 32)");
     float lx = r.x + labelW, lw = r.w - labelW;
+    const double visible = visibleBeats();
+    arrangementScroll_ = std::clamp(arrangementScroll_, 0.0, std::max(0.0, project_.timelineBeats - visible));
+    auto at = [&](double beat) { return lx + float((beat - arrangementScroll_) / visible) * lw; };
+    const int first = int(std::floor(arrangementScroll_)),
+              last = int(std::ceil(arrangementScroll_ + visible));
     box(c, {lx, r.y, lw, 45}, head);
-    for (int bar = 0; bar < 8; ++bar) {
-        float xx = lx + lw * bar / 8;
-        line(c, xx, r.y, xx, r.y + 23, 0xff46494a);
-        text(c, std::to_string(bar + 1), xx + 8, r.y + 16, 10, 0xffaeb3b0);
+    for (int tick = first; tick <= last; ++tick) {
+        float xx = at(tick);
+        if (tick % 4 == 0) {
+            line(c, xx, r.y, xx, r.y + 23, 0xff46494a);
+            text(c, std::to_string(tick / 4 + 1), xx + 8, r.y + 16, 10, 0xffaeb3b0);
+        }
+        line(c, xx, r.y + 23, xx, r.y + 45, 0xff393d3d);
     }
     line(c, lx, r.y + 23, lx + lw, r.y + 23, 0xff383b3d);
-    for (int i = 0; i <= 32; ++i) {
-        line(c, lx + lw * i / 32, r.y + 23, lx + lw * i / 32, r.y + 45, 0xff393d3d);
-    }
     if (project_.loop) {
-        box(c, {lx, r.y + 28, lw * .75f, 13}, 0x25bea47a);
-        line(c, lx + 1, r.y + 28, lx + 1, r.y + 41, 0xffcbaa77, 2);
-        line(c, lx + lw * .75f - 1, r.y + 28, lx + lw * .75f - 1, r.y + 41, 0xffcbaa77, 2);
+        float start = std::clamp(at(0), lx, lx + lw), end = std::clamp(at(project_.loopBeats), lx, lx + lw);
+        box(c, {start, r.y + 28, std::max(0.0f, end - start), 13}, 0x25bea47a);
+        line(c, start + 1, r.y + 28, start + 1, r.y + 41, 0xffcbaa77, 2);
+        line(c, end - 1, r.y + 28, end - 1, r.y + 41, 0xffcbaa77, 2);
     }
     buttons_.push_back({{lx, r.y, lw, 45}, "seek", "Click ruler to seek", true});
     line(c, r.x, r.y + 44, r.x + r.w, r.y + 44, 0xff444748);
@@ -647,7 +721,7 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
         float y = viewport.y + float(i) * 79 - trackScroll_;
         const auto &t = project_.tracks[i];
         box(c, {r.x, y, labelW, 79}, int(i) == selected_ ? 0xff333638 : 0xff282a2c);
-        box(c, {r.x, y, 3, 79}, colors[i]);
+        box(c, {r.x, y, 3, 79}, colors[i % colors.size()]);
         line(c, r.x + labelW - 1, y, r.x + labelW - 1, y + 79, 0xff454849);
         char id[8];
         std::snprintf(id, sizeof(id), "%02d", int(i) + 1);
@@ -659,7 +733,7 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
         }
         for (int k = 0; k < 3; ++k) {
             Rect b{r.x + 13 + k * 22.0f, y + 42, 19, 17};
-            box(c, b, (k == 0 ? t.muted : k == 1 ? t.solo : false) ? 0xff8b7760 : 0xff282a2c, 2);
+            box(c, b, (k == 0 ? t.muted : k == 1 ? t.solo : t.armed) ? 0xff8b7760 : 0xff282a2c, 2);
             outline(c, b, 0xff424647);
             tool(c, b,
                  k == 0   ? "M"
@@ -669,21 +743,26 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
                   : k == 1 ? "solo"
                            : "arm") +
                      std::to_string(i),
-                 false, k != 2,
+                 false, true,
                  k == 0   ? "Mute"
                  : k == 1 ? "Solo"
-                          : "Recording is not implemented");
+                          : "Arm audio recording");
         }
+        c.save();
+        c.clipRect(SkRect::MakeXYWH(lx, viewport.y, lw, viewport.h));
         box(c, {lx, y, lw, 79}, i % 2 ? 0xff202324 : 0xff212425);
-        for (int k = 0; k <= 32; ++k) {
-            line(c, lx + lw * k / 32, y, lx + lw * k / 32, y + 79, k % 4 == 0 ? 0xff454848 : 0xff313638);
+        for (int k = first; k <= last; ++k) {
+            line(c, at(k), y, at(k), y + 79, k % 4 == 0 ? 0xff454848 : 0xff313638);
         }
         for (size_t n = 0; n < t.clips.size(); ++n) {
             const auto &clip = t.clips[n];
-            Rect cr{lx + float(clip.beat) / 32 * lw, y + 8, float(clip.length) / 32 * lw, 63};
-            box(c, cr, mixed(colors[i], 0xff333739, .27f));
-            outline(c, cr, mixed(colors[i], 0xff131616, .21f));
-            if (int(i) == selected_ && int(n) == selectedClip_) {
+            Rect cr{at(clip.beat), y + 8, float(clip.length / visible) * lw, 63};
+            if (cr.x + cr.w <= lx || cr.x >= lx + lw) {
+                continue;
+            }
+            box(c, cr, mixed(colors[i % colors.size()], 0xff333739, .27f));
+            outline(c, cr, mixed(colors[i % colors.size()], 0xff131616, .21f));
+            if (editing_.contains(ClipRef{i, n}) || (int(i) == selected_ && int(n) == selectedClip_)) {
                 Rect inner{cr.x + 1, cr.y + 1, cr.w - 2, cr.h - 2};
                 outline(c, inner, 0xfff2eadb);
             }
@@ -692,9 +771,10 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
             text(c, clip.name, cr.x + 7, cr.y + 14, 10, 0xff171a1b, true);
             if (clip.audio) {
                 const auto *source = project_.source(clip.sourceId);
-                if (source && source->pcm) {
-                    const double duration = double(source->pcm->size() / 2) / 48000;
-                    for (int px = 0; px < int(cr.w) - 10; px += 3) {
+                if (source && (source->pcm || source->stream)) {
+                    const double duration = double(source->originalFrames) / source->originalRate;
+                    for (int px = std::max(0, int(lx - cr.x - 5));
+                         px < std::min(int(cr.w) - 10, int(lx + lw - cr.x - 5)); px += 3) {
                         const double seconds = clip.sourceOffset + double(px) / std::max(1.0f, cr.w - 10) *
                                                                        clip.length * 60 / project_.bpm;
                         if (!clip.sourceLoop && seconds >= duration) {
@@ -717,21 +797,26 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
                 }
             }
             c.restore();
-            Rect hit = intersect(cr, viewport);
+            Rect hit = intersect(cr, lanes_);
             if (hit.w > 0 && hit.h > 0) {
                 clips_.push_back({hit, i, n});
             }
         }
+        c.restore();
         line(c, r.x, y + 78, r.x + r.w, y + 78, 0xff343839);
     }
     float emptyY = viewport.y + float(project_.tracks.size()) * 79 - trackScroll_;
-    for (int bar = 0; bar < 8; ++bar) {
-        line(c, lx + lw * bar / 8, std::max(viewport.y, emptyY), lx + lw * bar / 8, viewport.y + viewport.h,
-             0xff292d2e);
+    for (int bar = first; bar <= last; ++bar) {
+        if (bar % 4 == 0) {
+            line(c, at(bar), std::max(viewport.y, emptyY), at(bar), viewport.y + viewport.h, 0xff292d2e);
+        }
     }
     c.restore();
     hitClip_ = {0, 0, width_, height_};
-    float ph = lx + float(beat / 32) * lw;
+    float ph = at(beat);
+    if (ph < lx || ph > lx + lw) {
+        return;
+    }
     line(c, ph, viewport.y, ph, viewport.y + viewport.h, 0xffe2b679);
     SkPaint p;
     p.setColor(0xffe2b679);
@@ -744,7 +829,7 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
 }
 
 void Workspace::menu(SkCanvas &c) {
-    if (!patternMenu_ && !audioMenu_) {
+    if (!patternMenu_ && !audioMenu_ && !inputMenu_ && !midiMenu_) {
         menuRect_ = {};
         return;
     }
@@ -777,6 +862,27 @@ void Workspace::menu(SkCanvas &c) {
         tool(c, {r.x + 8, r.y + 310, width - 16, 24}, "Assign pattern to selected clip", "assign-pattern",
              false, midiClip);
         tool(c, {r.x + width - 75, r.y + 340, 66, 23}, "Close", "patterns");
+    } else if (inputMenu_ || midiMenu_) {
+        text(c, inputMenu_ ? "AUDIO INPUT" : "MIDI INPUT", r.x + 12, r.y + 20, 11, ink, true);
+        if (inputMenu_) {
+            const size_t begin = size_t(inputPage_) * 8;
+            for (size_t i = begin; i < std::min(begin + 8, inputDevices.size()); ++i) {
+                tool(c, {r.x + 8, r.y + 30 + float(i - begin) * 25, width - 16, 24},
+                     inputDevices[i].name.substr(0, 57), "input:" + inputDevices[i].id,
+                     inputConfig.deviceId == inputDevices[i].id);
+            }
+        } else {
+            const size_t begin = size_t(midiPage_) * 8;
+            for (size_t i = begin; i < std::min(begin + 8, midiPorts.size()); ++i) {
+                tool(c, {r.x + 8, r.y + 30 + float(i - begin) * 25, width - 16, 24},
+                     midiPorts[i].name.substr(0, 57), "midi-port:" + std::to_string(midiPorts[i].index));
+            }
+            text(c, midiStatus.substr(0, 65), r.x + 12, r.y + 260, 10);
+            text(c, "Dropped MIDI events: " + std::to_string(midiDropped), r.x + 12, r.y + 279, 10, dim);
+        }
+        tool(c, {r.x + 8, r.y + 230, width - 16, 24}, "Next devices", inputMenu_ ? "input-page" : "midi-page",
+             false, (inputMenu_ ? inputDevices.size() : midiPorts.size()) > 8);
+        tool(c, {r.x + 8, r.y + 290, width - 16, 24}, "Back to audio output", "audio-settings");
     } else {
         text(c, "AUDIO OUTPUT", r.x + 12, r.y + 20, 11, ink, true);
         const auto begin = size_t(std::max(0, devicePage_)) * 8;
@@ -803,9 +909,12 @@ void Workspace::menu(SkCanvas &c) {
                  number(double(audioStats.maxProcessNs) / 1e6) + " ms",
              r.x + 12, r.y + 352, 10);
         text(c,
-             "Frames: " + std::to_string(audioStats.processedFrames) +
+             "Stream misses: " + std::to_string(engine_.streamUnderruns()) +
+                 " / Frames: " + std::to_string(audioStats.processedFrames) +
                  " / native error: " + std::to_string(audioStats.errorCode),
              r.x + 12, r.y + 373, 10, dim);
+        tool(c, {r.x + 8, r.y + 393, 75, 24}, "Input", "input-settings");
+        tool(c, {r.x + 90, r.y + 393, 75, 24}, "MIDI", "midi-settings");
         tool(c, {r.x + width - 75, r.y + 393, 66, 24}, "Close", "audio-settings");
     }
 }
@@ -834,7 +943,7 @@ void Workspace::audioClip(SkCanvas &c, Rect r) {
             auto peak = source->peaks[std::min<size_t>(1023, size_t(double(x) / wave.w * 1024))];
             const float height = std::min(1.0f, peak * 2) * wave.h * .85f;
             line(c, wave.x + x, wave.y + (wave.h - height) / 2, wave.x + x, wave.y + (wave.h + height) / 2,
-                 colors[size_t(selected_)]);
+                 colors[size_t(selected_) % colors.size()]);
         }
         const double duration = double(source->originalFrames) / source->originalRate;
         const float at = wave.x + float(clip.sourceOffset / duration) * wave.w;
@@ -881,7 +990,7 @@ void Workspace::piano(SkCanvas &c, Rect r, double beat) {
         }
         Rect nr{grid_.x + float(n.beat - scrollBeat_) * bw, grid_.y + (topKey_ - n.key) * row + 1,
                 std::max(3.0f, float(n.length) * bw), row - 2};
-        box(c, nr, int(i) == selectedNote_ ? 0xffe8be87 : 0xffd9ab76, 1);
+        box(c, nr, (editing_.contains(i) || int(i) == selectedNote_) ? 0xffe8be87 : 0xffd9ab76, 1);
         outline(c, nr, 0xffefd0a4);
         text(c, noteName(n.key), nr.x + 4, nr.y + 11, 9, 0xff463528);
     }
@@ -908,36 +1017,81 @@ void Workspace::piano(SkCanvas &c, Rect r, double beat) {
 
 void Workspace::devices(SkCanvas &c, Rect r) {
     box(c, r, panel);
-    const std::array names{project_.tracks[size_t(selected_)].name, std::string("EQ"), std::string("Reverb")};
+    const auto &track = project_.tracks[size_t(selected_)];
+    const std::array names{track.instrument == audio::Instrument::Synth     ? std::string("Synth")
+                           : track.instrument == audio::Instrument::Sampler ? std::string("Sampler")
+                                                                            : std::string("Drum machine"),
+                           std::string("EQ"), std::string("Compressor / Delay")};
     const std::array<std::array<const char *, 3>, 3> labels{
-        {{{"Cutoff", "Res", "Drive"}}, {{"Low", "Mid", "High"}}, {{"Size", "Wet", ""}}}};
+        {{{"Cutoff", "Attack", "Release"}}, {{"Low", "Mid", "High"}}, {{"Thresh", "Wet", "Time"}}}};
+    const std::array<std::array<int, 3>, 3> knobs{{{{0, 2, 3}}, {{4, 5, 6}}, {{7, 8, 9}}}};
+    const float cardW = std::min(176.0f, (r.w - 32) / 3);
     for (int i = 0; i < 3; ++i) {
-        float x = r.x + 10 + i * 183;
-        Rect card{x, r.y + 10, 176, r.h - 20};
+        float x = r.x + 10 + i * (cardW + 7);
+        Rect card{x, r.y + 10, cardW, r.h - 20};
         box(c, card, 0xff2d3031);
         outline(c, card, 0xff515657);
         text(c, names[i], x + 10, r.y + 31, 10, 0xffd8dad5, true);
-        for (int k = 0; k < (i == 2 ? 2 : 3); ++k) {
-            float cx = x + 26.5f + k * 44, cy = r.y + 64.5f;
-            bool enabled = i == 0 && k == 0 && selected_ != 3;
-            SkPaint p;
-            p.setStyle(SkPaint::kStroke_Style);
-            p.setStrokeWidth(5);
-            p.setColor(0xff575e5c);
-            p.setAntiAlias(true);
-            c.drawCircle(cx, cy, 13, p);
-            p.setColor(enabled ? 0xffd6aa73 : 0xff8d877b);
-            c.drawArc(SkRect::MakeXYWH(cx - 13, cy - 13, 26, 26), -135, 90, false, p);
-            centered(c, labels[i][k], {cx - 22, cy + 21.5f, 44, 13}, 9, 0xffaaaaaa);
-            Rect hit{cx - 17, cy - 17, 34, 48};
-            buttons_.push_back({hit, enabled ? "knob0" : "fx" + std::to_string(i) + std::to_string(k),
-                                enabled ? "Drag to adjust cutoff: " +
-                                              number(project_.tracks[size_t(selected_)].cutoff) + " Hz"
-                                        : std::string(labels[i][k]) + ": not implemented",
-                                enabled});
+        if (i == 0) {
+            buttons_.push_back({{x + 4, r.y + 12, cardW - 8, 24},
+                                "instrument",
+                                "Cycle Synth / Sampler / Drum machine",
+                                true});
         }
-        if (i > 0) {
-            text(c, "Unavailable", x + 10, r.y + r.h - 21, 9, dim);
+        for (int k = 0; k < 3; ++k) {
+            float cx = x + cardW * (k + .6f) / 3, cy = r.y + 64.5f;
+            SkPaint paint;
+            paint.setStyle(SkPaint::kStroke_Style);
+            paint.setStrokeWidth(5);
+            paint.setColor(0xff575e5c);
+            paint.setAntiAlias(true);
+            c.drawCircle(cx, cy, 13, paint);
+            paint.setColor(0xffd6aa73);
+            c.drawArc(SkRect::MakeXYWH(cx - 13, cy - 13, 26, 26), -135, 90, false, paint);
+            centered(
+                c, i == 0 && k == 0 && track.instrument == audio::Instrument::Sampler ? "Root" : labels[i][k],
+                {cx - 22, cy + 21.5f, 44, 13}, 9, 0xffaaaaaa);
+            buttons_.push_back(
+                {{cx - 17, cy - 17, 34, 48},
+                 "knob" + std::to_string(i == 0 && k == 0 && track.instrument == audio::Instrument::Sampler
+                                             ? 11
+                                             : knobs[i][k]),
+                 std::string("Drag: ") + labels[i][k],
+                 true});
+        }
+        if (i == 0) {
+            const auto *source = project_.source(track.instrument == audio::Instrument::Drum &&
+                                                         track.drumSources[size_t(drumPad_)]
+                                                     ? track.drumSources[size_t(drumPad_)]
+                                                     : track.instrumentSource);
+            tool(c, {x + 8, r.y + 111, cardW - 16, 23},
+                 track.instrument == audio::Instrument::Synth
+                     ? std::array{"Sine", "Saw", "Triangle"}[track.waveform]
+                 : source ? source->name
+                          : "Missing sample",
+                 track.instrument == audio::Instrument::Synth ? "waveform" : "instrument-source");
+            tool(c, {x + 8, r.y + 139, cardW - 16, 23},
+                 track.instrument == audio::Instrument::Drum ? "Pad: " + std::to_string(36 + drumPad_)
+                 : monitoring                                ? "Monitor: On"
+                                                             : "Monitor: Off",
+                 track.instrument == audio::Instrument::Drum ? "drum-pad" : "monitor", monitoring);
+            tool(c, {x + 8, r.y + 167, cardW - 16, 23},
+                 "Input: " + std::string(track.inputChannel == 0   ? "Stereo"
+                                         : track.inputChannel == 1 ? "Left"
+                                                                   : "Right"),
+                 "input-channel");
+        } else if (i == 1) {
+            text(c, "Low / Mid / High", x + 10, r.y + 128, 10, dim);
+            text(c,
+                 number(track.strip.lowDb) + " / " + number(track.strip.midDb) + " / " +
+                     number(track.strip.highDb) + " dB",
+                 x + 10, r.y + 149, 10);
+        } else {
+            text(c, "Threshold " + number(track.strip.thresholdDb) + " dB", x + 10, r.y + 128, 10);
+            text(c, "Delay " + number(track.strip.delaySeconds * 1000) + " ms", x + 10, r.y + 149, 10);
+            tool(c, {x + 8, r.y + 167, cardW - 16, 23},
+                 project_.buses[0].delayWet > 0 ? "Bus 1 delay: On" : "Bus 1 delay: Off", "bus-delay",
+                 project_.buses[0].delayWet > 0);
         }
     }
 }
@@ -945,13 +1099,14 @@ void Workspace::devices(SkCanvas &c, Rect r) {
 void Workspace::mixer(SkCanvas &c, Rect r) {
     box(c, r, 0xff202324);
     mixerScroll_ =
-        std::clamp(mixerScroll_, 0.0f, std::max(0.0f, float((project_.tracks.size() + 1) * 95) - r.w));
+        std::clamp(mixerScroll_, 0.0f,
+                   std::max(0.0f, float((project_.tracks.size() + 1 + audio::Plan::maxBuses) * 95) - r.w));
     for (size_t i = 0; i <= project_.tracks.size(); ++i) {
         bool master = i == project_.tracks.size();
         float x = r.x + i * 95 - mixerScroll_;
         box(c, {x, r.y, 95, r.h}, 0xff2b2e30);
         line(c, x + 94, r.y, x + 94, r.y + r.h, 0xff44494a);
-        box(c, {x + 9, r.y + 8, 77, 3}, master ? 0xffb8babc : colors[i]);
+        box(c, {x + 9, r.y + 8, 77, 3}, master ? 0xffb8babc : colors[i % colors.size()]);
         text(c, master ? "Master" : project_.tracks[i].name, x + 9, r.y + 30, 10, 0xffd4d8d4);
         float fh = std::min(122.0f, r.h - 90), fy = r.y + 42 + (r.h - 90 - fh) / 2;
         float gain = master ? project_.masterGain : project_.tracks[i].gain;
@@ -974,6 +1129,17 @@ void Workspace::mixer(SkCanvas &c, Rect r) {
             box(c, {meter.x + 1, meter.y + fh - j - 1, 5, 1}, color);
         }
         float y = r.y + r.h - 31;
+        if (!master) {
+            tool(c, {x + 5, r.y + 32, 40, 15}, "Pan " + number(project_.tracks[i].strip.pan),
+                 "pan" + std::to_string(i), false, true, "Drag pan");
+            tool(c, {x + 46, r.y + 32, 44, 15},
+                 project_.tracks[i].strip.route < 0
+                     ? "Master"
+                     : "Bus " + std::to_string(project_.tracks[i].strip.route + 1),
+                 "route" + std::to_string(i));
+            tool(c, {x + 5, r.y + r.h - 52, 85, 17}, "Send 1: " + number(project_.tracks[i].strip.sends[0]),
+                 "send" + std::to_string(i));
+        }
         for (int k = 0; k < 2; ++k) {
             Rect b{x + 9 + k * 40.0f, y, 37, 23};
             bool on = master ? (k == 0 && project_.masterMuted)
@@ -989,11 +1155,68 @@ void Workspace::mixer(SkCanvas &c, Rect r) {
                                   : "Solo");
         }
     }
+    for (size_t bus = 0; bus < audio::Plan::maxBuses; ++bus) {
+        float x = r.x + float(project_.tracks.size() + 1 + bus) * 95 - mixerScroll_;
+        box(c, {x, r.y, 95, r.h}, 0xff2b2e30);
+        line(c, x + 94, r.y, x + 94, r.y + r.h, edge);
+        box(c, {x + 9, r.y + 8, 77, 3}, gold);
+        text(c, "Bus " + std::to_string(bus + 1), x + 9, r.y + 30, 10);
+        tool(c, {x + 8, r.y + 35, 79, 20},
+             project_.buses[bus].route < 0 ? "To Master"
+                                           : "To Bus " + std::to_string(project_.buses[bus].route + 1),
+             "bus-route:" + std::to_string(bus));
+        float fh = std::max(20.0f, r.h - 113), fy = r.y + 62;
+        size_t index = project_.tracks.size() + 1 + bus;
+        faders_[index] = {x + 28, fy, 22, fh};
+        box(c, {x + 37, fy, 3, fh}, bg);
+        float at = fy + (1 - project_.busGains[bus]) * fh;
+        box(c, {x + 28, at - 4, 22, 8}, 0xffa9aaa5, 2);
+        buttons_.push_back(
+            {intersect(faders_[index], hitClip_), "gain" + std::to_string(index), "Bus volume", true});
+        tool(c, {x + 8, r.y + r.h - 34, 79, 23}, project_.buses[bus].delayWet > 0 ? "Delay On" : "Delay Off",
+             "bus-fx:" + std::to_string(bus));
+    }
 }
 
 void Workspace::action(const std::string &act) {
     try {
         if (busy()) {
+            return;
+        }
+        if ((recordingAudio || recordingMidi) && act != "stop" && act != "record" && act != "record-midi" &&
+            act != "piano" && act != "devices" && act != "mixer") {
+            status = "Stop the take before editing the document";
+            return;
+        }
+        if (act == "record") {
+            if (requestRecord) {
+                requestRecord();
+            }
+            return;
+        }
+        if (act == "monitor") {
+            if (requestMonitor) {
+                requestMonitor();
+            }
+            return;
+        }
+        if (act == "record-midi") {
+            if (recordingMidi) {
+                finishMidi();
+            } else {
+                if (recordingAudio) {
+                    status = "Stop audio take first";
+                    return;
+                }
+                midiTrack_ = size_t(selected_);
+                midiTake_.begin(engine_.timestamp(),
+                                double(engine_.position()) / (engine_.sampleRate() * 60 / project_.bpm),
+                                engine_.sampleRate() * 60 / project_.bpm);
+                recordingMidi = true;
+                engine_.looping(false);
+                engine_.play(true);
+                status = "Recording MIDI to " + project_.tracks[midiTrack_].name;
+            }
             return;
         }
         if (act == "play") {
@@ -1002,6 +1225,10 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if (act == "stop") {
+            if (recordingAudio && requestRecord) {
+                requestRecord();
+            }
+            finishMidi();
             engine_.play(false);
             engine_.rewind();
             status = "Ready";
@@ -1030,8 +1257,7 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if (act == "zoom+" || act == "zoom-") {
-            zoom_ = std::clamp(zoom_ * (act == "zoom+" ? 1.25 : .8), 1.0, 8.0);
-            scrollBeat_ = std::clamp(scrollBeat_, 0.0, 4 - 4 / zoom_);
+            arrangementZoom_ = std::clamp(arrangementZoom_ * (act == "zoom+" ? 1.25 : .8), .25, 8.0);
             return;
         }
         if (act == "tempo") {
@@ -1045,12 +1271,13 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if (act == "instruments") {
+            detail_ = Detail::Devices;
             search_.clear();
             focus_ = Focus::None;
             return;
         }
         if (act == "save" || act == "saveas" || act == "load" || act == "export" || act == "import" ||
-            act == "relink") {
+            act == "relink" || act == "record-audio") {
             if (act == "relink") {
                 auto &clips = project_.tracks[size_t(selected_)].clips;
                 if (selectedClip_ < 0 || selectedClip_ >= int(clips.size()) ||
@@ -1085,6 +1312,7 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if (act == "audio-settings") {
+            inputMenu_ = midiMenu_ = false;
             audioMenu_ = !audioMenu_;
             patternMenu_ = false;
             return;
@@ -1117,6 +1345,57 @@ void Workspace::action(const std::string &act) {
             status = "Source start in seconds: type and Enter";
             return;
         }
+        if (act == "drum-pad") {
+            drumPad_ = (drumPad_ + 1) % 16;
+            return;
+        }
+        if (act == "copy") {
+            editing_.copy(project_, size_t(selected_));
+            status = "Selection copied";
+            return;
+        }
+        if (act == "select-all") {
+            editing_.clear();
+            if (editing_.notes) {
+                for (size_t i = 0; i < project_.tracks[size_t(selected_)].pattern().notes.size(); ++i) {
+                    editing_.selectedNotes.push_back(i);
+                }
+            } else {
+                for (size_t t = 0; t < project_.tracks.size(); ++t) {
+                    for (size_t i = 0; i < project_.tracks[t].clips.size(); ++i) {
+                        editing_.selectedClips.push_back({t, i});
+                    }
+                }
+            }
+            return;
+        }
+        if (act == "input-settings" || act == "midi-settings") {
+            inputMenu_ = act == "input-settings";
+            midiMenu_ = !inputMenu_;
+            audioMenu_ = patternMenu_ = false;
+            return;
+        }
+        if (act == "input-page" || act == "midi-page") {
+            auto &page = act == "input-page" ? inputPage_ : midiPage_;
+            const auto count = act == "input-page" ? inputDevices.size() : midiPorts.size();
+            page = (page + 1) % int(std::max<size_t>(1, (count + 7) / 8));
+            return;
+        }
+        if (act.starts_with("input:")) {
+            inputConfig.deviceId = act.substr(6);
+            if (requestInput) {
+                requestInput(inputConfig);
+            }
+            inputMenu_ = false;
+            return;
+        }
+        if (act.starts_with("midi-port:")) {
+            if (requestMidi) {
+                requestMidi(size_t(std::stoul(act.substr(10))));
+            }
+            midiMenu_ = false;
+            return;
+        }
         if (act == "undo" || act == "redo") {
             auto &from = act == "undo" ? undo_ : redo_;
             auto &to = act == "undo" ? redo_ : undo_;
@@ -1127,6 +1406,7 @@ void Workspace::action(const std::string &act) {
                 selected_ = std::min(selected_, int(project_.tracks.size()) - 1);
                 selectedNote_ = -1;
                 selectedClip_ = 0;
+                editing_.clear();
                 changed();
                 status = act == "undo" ? "Undo" : "Redo";
             }
@@ -1136,6 +1416,9 @@ void Workspace::action(const std::string &act) {
             size_t i = std::stoul(act.substr(5));
             if (i < project_.tracks.size()) {
                 release();
+                if (selected_ != int(i)) {
+                    editing_.clear();
+                }
                 selected_ = int(i);
                 selectedClip_ = 0;
                 selectedNote_ = -1;
@@ -1161,16 +1444,134 @@ void Workspace::action(const std::string &act) {
             move(mouseX_, mouseY_);
             return;
         }
+        if (act.starts_with("pan")) {
+            selected_ = std::stoi(act.substr(3));
+            knobDrag_ = 10;
+            before_ = project_;
+            dragY_ = mouseY_;
+            knobOriginal_ = project_.tracks[size_t(selected_)].strip.pan;
+            return;
+        }
+        if (act.starts_with("route") || act.starts_with("send")) {
+            if (act.size() > (act.starts_with("route") ? 5u : 4u)) {
+                selected_ = std::stoi(act.substr(act.starts_with("route") ? 5 : 4));
+            }
+        }
         if (act.starts_with("knob")) {
             knobDrag_ = std::stoi(act.substr(4));
             before_ = project_;
             dragY_ = mouseY_;
             const auto &t = project_.tracks[size_t(selected_)];
-            knobOriginal_ = knobDrag_ == 0 ? t.cutoff : knobDrag_ == 2 ? t.attack : t.release;
+            knobOriginal_ = knobDrag_ == 0    ? t.cutoff
+                            : knobDrag_ == 2  ? t.attack
+                            : knobDrag_ == 3  ? t.release
+                            : knobDrag_ == 4  ? t.strip.lowDb
+                            : knobDrag_ == 5  ? t.strip.midDb
+                            : knobDrag_ == 6  ? t.strip.highDb
+                            : knobDrag_ == 7  ? t.strip.thresholdDb
+                            : knobDrag_ == 8  ? t.strip.delayWet
+                            : knobDrag_ == 11 ? float(t.rootKey)
+                                              : t.strip.delaySeconds;
             return;
         }
         before_ = project_;
-        if (act == "new-pattern" || act == "duplicate-pattern") {
+        if (act == "new-project") {
+            project_ = Project::empty();
+            selected_ = 0;
+            selectedClip_ = selectedNote_ = -1;
+            editing_.clear();
+            arrangementScroll_ = 0;
+            document_.opened(project_, {});
+            status = "New project";
+        } else if (act == "extend-timeline") {
+            project_.timelineBeats = std::min(Project::maxTimeline, project_.timelineBeats + 32);
+        } else if (act == "loop-to-end") {
+            project_.loopBeats = project_.timelineBeats;
+        } else if (act == "paste" || act == "duplicate" || act == "delete" || act == "cut") {
+            if (act == "cut") {
+                editing_.copy(project_, size_t(selected_));
+            }
+            if (act == "paste") {
+                editing_.paste(project_, size_t(selected_), pasteBeat_);
+            } else if (act == "duplicate") {
+                editing_.duplicate(project_, size_t(selected_));
+            } else {
+                editing_.erase(project_, size_t(selected_));
+                selectedNote_ = selectedClip_ = -1;
+            }
+        } else if (act.starts_with("nudge:")) {
+            int direction = std::stoi(act.substr(6));
+            editing_.transform(project_, size_t(selected_),
+                               direction == 1    ? snap_
+                               : direction == -1 ? -snap_
+                                                 : 0,
+                               direction == 2    ? 1
+                               : direction == -2 ? -1
+                                                 : 0,
+                               false);
+        } else if (act.starts_with("resize:")) {
+            editing_.transform(project_, size_t(selected_), std::stoi(act.substr(7)) * snap_, 0, true);
+        } else if (act.starts_with("arm")) {
+            auto &track = project_.tracks.at(size_t(std::stoul(act.substr(3))));
+            track.armed = !track.armed;
+        } else if (act == "input-channel") {
+            auto &track = project_.tracks[size_t(selected_)];
+            track.inputChannel = (track.inputChannel + 1) % 3;
+        } else if (act == "instrument") {
+            auto &track = project_.tracks[size_t(selected_)];
+            track.instrument = audio::Instrument((int(track.instrument) + 1) % 3);
+            if (track.instrument != audio::Instrument::Synth) {
+                const auto *source = project_.source(track.instrumentSource);
+                if (!source || source->stream) {
+                    throw std::runtime_error("Choose a resident sample for this instrument");
+                }
+            }
+        } else if (act == "instrument-source") {
+            auto &track = project_.tracks[size_t(selected_)];
+            uint32_t current =
+                track.instrument == audio::Instrument::Drum && track.drumSources[size_t(drumPad_)]
+                    ? track.drumSources[size_t(drumPad_)]
+                    : track.instrumentSource;
+            size_t at = 0;
+            for (size_t i = 0; i < project_.sources.size(); ++i) {
+                if (project_.sources[i].id == current) {
+                    at = i;
+                }
+            }
+            for (size_t i = 1; i <= project_.sources.size(); ++i) {
+                const auto &source = project_.sources[(at + i) % project_.sources.size()];
+                if (source.pcm) {
+                    if (track.instrument == audio::Instrument::Drum) {
+                        track.drumSources[size_t(drumPad_)] = source.id;
+                    } else {
+                        track.instrumentSource = source.id;
+                    }
+                    break;
+                }
+            }
+        } else if (act == "waveform") {
+            auto &track = project_.tracks[size_t(selected_)];
+            track.waveform = uint8_t((track.waveform + 1) % 3);
+        } else if (act.starts_with("route")) {
+            auto &strip = project_.tracks[size_t(selected_)].strip;
+            strip.route = strip.route == 3 ? -1 : strip.route + 1;
+        } else if (act.starts_with("send")) {
+            auto &strip = project_.tracks[size_t(selected_)].strip;
+            strip.sends[0] = strip.sends[0] == 0 ? .25f : 0;
+        } else if (act.starts_with("bus-route:")) {
+            auto bus = size_t(std::stoul(act.substr(10)));
+            auto &strip = project_.buses.at(bus);
+            strip.route = strip.route == 3 ? -1 : strip.route < 0 ? int(bus + 1) : strip.route + 1;
+            if (bus == 3) {
+                strip.route = -1;
+            }
+        } else if (act.starts_with("bus-fx:")) {
+            auto &strip = project_.buses.at(size_t(std::stoul(act.substr(7))));
+            strip.delayWet = strip.delayWet == 0 ? .4f : 0;
+        } else if (act == "bus-delay") {
+            project_.buses[0].delayWet = project_.buses[0].delayWet == 0 ? .4f : 0;
+        } else if (act == "new-pattern" || act == "duplicate-pattern") {
+            editing_.clear();
             project_.tracks[size_t(selected_)].createPattern(act == "duplicate-pattern");
             selectedNote_ = -1;
             if (selectedClip_ >= 0 && selectedClip_ < int(project_.tracks[size_t(selected_)].clips.size()) &&
@@ -1180,6 +1581,7 @@ void Workspace::action(const std::string &act) {
             patternMenu_ = false;
             status = project_.tracks[size_t(selected_)].pattern().name;
         } else if (act.starts_with("select-pattern:")) {
+            editing_.clear();
             auto id = uint32_t(std::stoul(act.substr(15)));
             auto &track = project_.tracks[size_t(selected_)];
             if (const auto *pattern = track.findPattern(id)) {
@@ -1221,6 +1623,7 @@ void Workspace::action(const std::string &act) {
             selectedClip_ = 0;
             selectedNote_ = -1;
             topKey_ = 72;
+            editing_.clear();
         } else if (act == "loop") {
             project_.loop = !project_.loop;
         } else if (act == "metronome") {
@@ -1251,13 +1654,25 @@ void Workspace::action(const std::string &act) {
         commitEdit();
         changed();
     } catch (const std::exception &e) {
-        before_.reset();
+        if (before_) {
+            project_ = *before_;
+            before_.reset();
+        }
         status = e.what();
     }
 }
 
-void Workspace::press(float x, float y, bool right) {
+void Workspace::press(float x, float y, bool right, bool additive) {
     if (busy()) {
+        return;
+    }
+    if (recordingAudio || recordingMidi) {
+        for (const auto &b : buttons_) {
+            if ((b.action == "record" || b.action == "stop") && b.rect.contains(x, y)) {
+                action(b.action);
+                return;
+            }
+        }
         return;
     }
     release();
@@ -1272,8 +1687,8 @@ void Workspace::press(float x, float y, bool right) {
     if (focus_ == Focus::Search && !searchBox_.contains(x, y)) {
         focus_ = Focus::None;
     }
-    if ((patternMenu_ || audioMenu_) && !menuRect_.contains(x, y)) {
-        patternMenu_ = audioMenu_ = false;
+    if ((patternMenu_ || audioMenu_ || inputMenu_ || midiMenu_) && !menuRect_.contains(x, y)) {
+        patternMenu_ = audioMenu_ = inputMenu_ = midiMenu_ = false;
         return;
     }
     if (divider_.contains(x, y)) {
@@ -1289,7 +1704,9 @@ void Workspace::press(float x, float y, bool right) {
                 return;
             }
             if (b.action == "seek") {
-                double beat = std::clamp(double(x - b.rect.x) / b.rect.w * 32, 0.0, 31.999);
+                double beat =
+                    std::clamp(arrangementScroll_ + double(x - b.rect.x) / b.rect.w * (visibleBeats()), 0.0,
+                               project_.timelineBeats - .001);
                 engine_.seek(uint64_t(std::llround(beat * engine_.sampleRate() * 60 / project_.bpm)));
                 return;
             }
@@ -1297,8 +1714,8 @@ void Workspace::press(float x, float y, bool right) {
             return;
         }
     }
-    if (patternMenu_ || audioMenu_) {
-        patternMenu_ = audioMenu_ = false;
+    if (patternMenu_ || audioMenu_ || inputMenu_ || midiMenu_) {
+        patternMenu_ = audioMenu_ = inputMenu_ = midiMenu_ = false;
         return;
     }
     if (lanes_.contains(x, y)) {
@@ -1306,11 +1723,30 @@ void Workspace::press(float x, float y, bool right) {
         if (track < 0 || track >= int(project_.tracks.size())) {
             return;
         }
-        action("track" + std::to_string(track));
+        if (!additive && selected_ != track) {
+            editing_.clear();
+        }
+        selected_ = track;
+        selectedNote_ = -1;
+        if (editing_.notes) {
+            editing_.clear();
+        }
+        editing_.notes = false;
+        pasteBeat_ = std::clamp(arrangementScroll_ + double(x - lanes_.x) / lanes_.w * (visibleBeats()), 0.0,
+                                project_.timelineBeats - .25);
         auto &clips = project_.tracks[size_t(track)].clips;
         for (auto it = clips_.rbegin(); it != clips_.rend(); ++it) {
             if (it->track == size_t(track) && it->rect.contains(x, y)) {
                 selectedClip_ = int(it->clip);
+                before_ = project_;
+                ClipRef ref{size_t(track), it->clip};
+                if (additive || !editing_.contains(ref)) {
+                    editing_.selectClip(ref, additive);
+                }
+                if (additive) {
+                    before_.reset();
+                    return;
+                }
                 if (!clips[it->clip].audio) {
                     project_.tracks[size_t(track)].activePattern = clips[it->clip].patternId;
                     const auto &notes = project_.tracks[size_t(track)].pattern().notes;
@@ -1325,9 +1761,8 @@ void Workspace::press(float x, float y, bool right) {
                     }
                     dirty_ = true;
                 }
-                before_ = project_;
                 if (right || erase_) {
-                    clips.erase(clips.begin() + selectedClip_);
+                    editing_.erase(project_, size_t(selected_));
                     selectedClip_ = -1;
                     commitEdit();
                     changed();
@@ -1336,21 +1771,34 @@ void Workspace::press(float x, float y, bool right) {
                 clipDrag_ = selectedClip_;
                 originalClip_ = clips[it->clip];
                 dragX_ = x;
-                float end = lanes_.x + float(originalClip_.beat + originalClip_.length) / 32 * lanes_.w;
+                float end =
+                    lanes_.x + float((originalClip_.beat + originalClip_.length - arrangementScroll_) /
+                                     (visibleBeats())) *
+                                   lanes_.w;
                 clipResize_ = x >= end - 9;
                 return;
             }
         }
+        if (additive && !right) {
+            marquee_ = true;
+            additiveMarquee_ = additive;
+            selectionBox_ = {x, y, 0, 0};
+            dragX_ = x;
+            dragY_ = y;
+            return;
+        }
         if (!right && !erase_) {
             before_ = project_;
-            double beat = std::floor((x - lanes_.x) / lanes_.w * 32 / 4) * 4;
+            double beat =
+                std::floor((arrangementScroll_ + (x - lanes_.x) / lanes_.w * (visibleBeats())) / 4) * 4;
             Clip clip;
             clip.name = project_.tracks[size_t(track)].pattern().name;
             clip.patternId = project_.tracks[size_t(track)].activePattern;
             clip.beat = beat;
-            clip.length = std::min(4.0, 32 - beat);
+            clip.length = std::min(4.0, project_.timelineBeats - beat);
             clips.push_back(clip);
             selectedClip_ = int(clips.size() - 1);
+            editing_.selectClip({size_t(track), size_t(selectedClip_)}, false);
             commitEdit();
             changed();
         }
@@ -1385,17 +1833,28 @@ void Workspace::press(float x, float y, bool right) {
     if (!grid_.contains(x, y)) {
         return;
     }
+    if (!editing_.notes) {
+        editing_.clear();
+    }
+    editing_.notes = true;
     int key = std::clamp(topKey_ - int((y - grid_.y) / row), 0, 127);
     double beat = std::clamp(scrollBeat_ + (x - grid_.x) / bw, 0.0, 3.999);
+    pasteBeat_ = std::floor(beat / snap_) * snap_;
     for (size_t i = notes.size(); i > 0; --i) {
         auto &n = notes[i - 1];
         if (n.key != key || beat < n.beat || beat > n.beat + n.length) {
             continue;
         }
         selectedNote_ = int(i - 1);
+        if (additive || !editing_.contains(i - 1)) {
+            editing_.selectNote(i - 1, additive);
+        }
+        if (additive) {
+            return;
+        }
         before_ = project_;
         if (right || erase_) {
-            notes.erase(notes.begin() + selectedNote_);
+            editing_.erase(project_, size_t(selected_));
             selectedNote_ = -1;
             commitEdit();
             changed();
@@ -1408,11 +1867,20 @@ void Workspace::press(float x, float y, bool right) {
         dragY_ = y;
         return;
     }
+    if (additive && !right) {
+        marquee_ = true;
+        additiveMarquee_ = additive;
+        selectionBox_ = {x, y, 0, 0};
+        dragX_ = x;
+        dragY_ = y;
+        return;
+    }
     if (!right && !erase_) {
         before_ = project_;
         beat = std::floor(beat / snap_) * snap_;
         notes.push_back({key, beat, std::min(snap_, 4 - beat), .75f});
         selectedNote_ = int(notes.size() - 1);
+        editing_.selectNote(size_t(selectedNote_), false);
         commitEdit();
         changed();
     }
@@ -1421,14 +1889,20 @@ void Workspace::press(float x, float y, bool right) {
 void Workspace::move(float x, float y) {
     mouseX_ = x;
     mouseY_ = y;
+    if (marquee_) {
+        selectionBox_ = {std::min(x, dragX_), std::min(y, dragY_), std::abs(x - dragX_),
+                         std::abs(y - dragY_)};
+    }
     if (dividerDrag_) {
         detailHeight_ = std::clamp(height_ - 23 - y - 5, 155.0f, height_ - 269);
     }
-    if (gainDrag_ >= 0 && gainDrag_ <= int(project_.tracks.size())) {
+    if (gainDrag_ >= 0 && gainDrag_ < int(project_.tracks.size() + 1 + audio::Plan::maxBuses)) {
         const auto &r = faders_[size_t(gainDrag_)];
         float gain = std::clamp(1 - (y - r.y) / r.h, 0.0f, 1.0f);
         if (gainDrag_ == int(project_.tracks.size())) {
             project_.masterGain = gain;
+        } else if (gainDrag_ > int(project_.tracks.size())) {
+            project_.busGains[size_t(gainDrag_) - project_.tracks.size() - 1] = gain;
         } else {
             project_.tracks[size_t(gainDrag_)].gain = gain;
         }
@@ -1443,33 +1917,70 @@ void Workspace::move(float x, float y) {
             t.attack = std::clamp(knobOriginal_ + d * 2, .001f, 2.0f);
         } else if (knobDrag_ == 3) {
             t.release = std::clamp(knobOriginal_ + d * 2, .001f, 2.0f);
+        } else if (knobDrag_ >= 4 && knobDrag_ <= 6) {
+            float value = std::clamp(knobOriginal_ + d * 24, -24.0f, 24.0f);
+            if (knobDrag_ == 4) {
+                t.strip.lowDb = value;
+            } else if (knobDrag_ == 5) {
+                t.strip.midDb = value;
+            } else {
+                t.strip.highDb = value;
+            }
+        } else if (knobDrag_ == 7) {
+            t.strip.thresholdDb = std::clamp(knobOriginal_ + d * 60, -60.0f, 0.0f);
+        } else if (knobDrag_ == 8) {
+            t.strip.delayWet = std::clamp(knobOriginal_ + d, 0.0f, 1.0f);
+        } else if (knobDrag_ == 9) {
+            t.strip.delaySeconds = std::clamp(knobOriginal_ + d, .01f, 1.0f);
+        } else if (knobDrag_ == 11) {
+            t.rootKey = uint8_t(std::clamp(int(std::lround(knobOriginal_ + d * 48)), 0, 127));
+        } else if (knobDrag_ == 10) {
+            t.strip.pan = std::clamp(knobOriginal_ + d * 2, -1.0f, 1.0f);
         }
         changed();
     }
-    if (clipDrag_ >= 0) {
-        auto &clip = project_.tracks[size_t(selected_)].clips[size_t(clipDrag_)];
-        double delta = std::round((x - dragX_) / lanes_.w * 32 / snap_) * snap_;
-        if (clipResize_) {
-            clip.length = std::clamp(originalClip_.length + delta, .25, 32 - clip.beat);
-        } else {
-            clip.beat = std::clamp(originalClip_.beat + delta, 0.0, 32 - clip.length);
-        }
+    if (clipDrag_ >= 0 && before_) {
+        project_ = *before_;
+        double delta = std::round((x - dragX_) / lanes_.w * (visibleBeats()) / snap_) * snap_;
+        editing_.transform(project_, size_t(selected_), delta, 0, clipResize_);
         changed();
     }
-    if (noteDrag_ >= 0) {
-        auto &note = project_.tracks[size_t(selected_)].pattern().notes[size_t(noteDrag_)];
+    if (noteDrag_ >= 0 && before_) {
+        project_ = *before_;
         double delta = std::round((x - dragX_) / (grid_.w / 4 * zoom_) / snap_) * snap_;
-        if (noteResize_) {
-            note.length = std::clamp(originalNote_.length + delta, .0625, 4 - note.beat);
-        } else {
-            note.beat = std::clamp(originalNote_.beat + delta, 0.0, 4 - note.length);
-            note.key = std::clamp(originalNote_.key - int(std::round((y - dragY_) / (grid_.h / 13))), 0, 127);
-        }
+        editing_.transform(project_, size_t(selected_), delta,
+                           -int(std::round((y - dragY_) / (grid_.h / 13))), noteResize_);
         changed();
     }
 }
 
 void Workspace::release() {
+    if (marquee_) {
+        if (!additiveMarquee_) {
+            editing_.clear();
+        }
+        if (editing_.notes) {
+            const auto &list = project_.tracks[size_t(selected_)].pattern().notes;
+            for (size_t i = 0; i < list.size(); ++i) {
+                const auto &n = list[i];
+                Rect rect{grid_.x + float(n.beat - scrollBeat_) * grid_.w / 4 * float(zoom_),
+                          grid_.y + (topKey_ - n.key) * grid_.h / 13,
+                          float(n.length) * grid_.w / 4 * float(zoom_), grid_.h / 13};
+                auto hit = intersect(rect, selectionBox_);
+                if (hit.w > 0 && hit.h > 0 && !editing_.contains(i)) {
+                    editing_.selectedNotes.push_back(i);
+                }
+            }
+        } else {
+            for (auto hit : clips_) {
+                auto rect = intersect(hit.rect, selectionBox_);
+                if (rect.w > 0 && rect.h > 0 && !editing_.contains(ClipRef{hit.track, hit.clip})) {
+                    editing_.selectedClips.push_back({hit.track, hit.clip});
+                }
+            }
+        }
+        marquee_ = false;
+    }
     if (auditionKey_ >= 0) {
         releaseKey_ = auditionKey_;
         releaseTrack_ = auditionTrack_;
@@ -1487,6 +1998,9 @@ void Workspace::wheel(float dy, bool pitch, bool pan) {
     }
     if (pitch) {
         topKey_ = std::clamp(topKey_ + int(dy * 2), 12, 127);
+    } else if (pan && mouseY_ < divider_.y) {
+        arrangementScroll_ = std::clamp(arrangementScroll_ - dy * 2, 0.0,
+                                        std::max(0.0, project_.timelineBeats - visibleBeats()));
     } else if (pan) {
         scrollBeat_ = std::clamp(scrollBeat_ + dy * .25, 0.0, 4 - 4 / zoom_);
     } else if (detail_ == Detail::Mixer && mouseY_ >= divider_.y) {
@@ -1616,6 +2130,74 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
         press(r.x + r.w / 2, r.y + r.h / 2, false);
         release();
     };
+    action("track0");
+    action("piano");
+    redraw();
+    float testBw = grid_.w / 4, testRow = grid_.h / 13;
+    auto firstNote = project_.tracks[0].pattern().notes[0],
+         secondNote = project_.tracks[0].pattern().notes[1];
+    float firstX = grid_.x + float(firstNote.beat + .1) * testBw,
+          firstY = grid_.y + (topKey_ - firstNote.key + .5f) * testRow;
+    press(firstX, firstY, false);
+    release();
+    press(grid_.x + float(secondNote.beat + .1) * testBw,
+          grid_.y + (topKey_ - secondNote.key + .5f) * testRow, false, true);
+    release();
+    check(editing_.selectedNotes.size() == 2, "Shift multi-note selection failed");
+    press(firstX, firstY, false);
+    move(firstX + testBw * .25f, firstY);
+    release();
+    check(project_.tracks[0].pattern().notes[0].beat == firstNote.beat + .25 &&
+              project_.tracks[0].pattern().notes[1].beat == secondNote.beat + .25,
+          "Group note move failed");
+    action("undo");
+    press(firstX, firstY, false);
+    release();
+    action("copy");
+    action("duplicate");
+    check(project_.tracks[0].pattern().notes.size() == baseline.tracks[0].pattern().notes.size() + 1,
+          "UI clipboard duplicate failed");
+    action("delete");
+    action("undo");
+    action("undo");
+    check(project_.tracks[0].pattern().notes == baseline.tracks[0].pattern().notes,
+          "Grouped clipboard Undo failed");
+    click("extend-timeline");
+    check(project_.timelineBeats == 64, "Timeline extension failed");
+    action("undo");
+    click("devices");
+    click("instrument");
+    check(project_.tracks[0].instrument == audio::Instrument::Sampler, "Sampler selection failed");
+    action("undo");
+    auto eqKnob =
+        std::find_if(buttons_.begin(), buttons_.end(), [](const auto &b) { return b.action == "knob4"; });
+    redraw();
+    eqKnob =
+        std::find_if(buttons_.begin(), buttons_.end(), [](const auto &b) { return b.action == "knob4"; });
+    auto eqRect = eqKnob->rect;
+    press(eqRect.x + 10, eqRect.y + 10, false);
+    move(eqRect.x + 10, eqRect.y - 20);
+    release();
+    check(project_.tracks[0].strip.lowDb > 0, "EQ control failed");
+    action("undo");
+    click("bus-delay");
+    check(project_.buses[0].delayWet > 0, "Bus effect failed");
+    action("undo");
+    click("arm0");
+    check(project_.tracks[0].armed, "Record arm failed");
+    action("undo");
+    // MIDI delivery fixture exercises the actual Workspace document take transaction.
+    action("record-midi");
+    const auto timestamp = engine_.timestamp();
+    midiMessage({timestamp, 0x90, 60, 100});
+    midiMessage({timestamp + 12000, 0x80, 60, 0});
+    finishMidi();
+    check(project_.tracks[0].patterns.size() > baseline.tracks[0].patterns.size(),
+          "Workspace MIDI take failed");
+    action("undo");
+    engine_.play(false);
+    engine_.rewind();
+    click("piano");
     action("track0");
     action("piano");
     redraw();
@@ -1774,8 +2356,8 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     check(!browser_, "Browser hide failed");
     click("browser");
     redraw();
-    auto disabled =
-        std::find_if(buttons_.begin(), buttons_.end(), [](const Button &b) { return b.action == "record"; });
+    auto disabled = std::find_if(buttons_.begin(), buttons_.end(),
+                                 [](const Button &b) { return b.action == "signature"; });
     Rect disabledRect = disabled->rect;
     const auto unmodified = project_;
     press(disabledRect.x + 10, disabledRect.y + 10, false);
@@ -1842,6 +2424,7 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
         throw;
     }
     project_ = baseline;
+    editing_ = {};
     before_.reset();
     undo_.clear();
     redo_.clear();

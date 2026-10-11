@@ -11,8 +11,8 @@
 | UI | 자체 구현 | 사용자 Studio 04 HTML 명세, 네이티브 직접 그리기/hit-test/편집 |
 | Audio / Media | 자체 엔진·프레임워크 | 독립 타깃과 실행 가능한 처리 경로 |
 | FFT / SIMD / resampling | PFFFT / Highway / libsoxr | libsoxr 0.1.3 실제 WAV 준비에 사용; PFFFT/Highway 직접 연동은 다음 단계 |
-| MIDI 장치 | libremidi | 4.5.0 실제 소스 연결, 첫 포트 Note On/Off |
-| MIDI 이벤트 / sequencer | 자체 구현 | channel message validation, beat→sample plan |
+| MIDI 장치 | libremidi | 4.5.0 실제 소스 연결, 선택 포트 Note On/Off, 선택 채널 라우팅, MIDI take |
+| MIDI 이벤트 / sequencer | 자체 구현 | channel message validation, beat→sample plan, monotonic timestamp/sample scheduling |
 
 Qt/egui/JUCE/Sleepy/FFmpeg를 애플리케이션 의존성으로 사용하지 않습니다. Skia 구성에서도 ffmpeg 기본 비활성화를 유지합니다. SDL의 내부 GPU 모듈이 빌드되어도 UI는 SDL_GL API와 Skia Ganesh GL만 사용합니다.
 

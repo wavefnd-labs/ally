@@ -1,10 +1,48 @@
 #include <ally/audio/backend.hpp>
+#include <ally/audio/capture.hpp>
 #include <ally/audio/engine.hpp>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
-int main(int argc, char **) {
+struct Sink : ally::audio::CaptureSink {
+    std::atomic<uint64_t> frames{0};
+    void capture(std::span<const float> pcm, uint16_t channels) noexcept override {
+        frames.fetch_add(pcm.size() / channels);
+    }
+};
+int main(int argc, char **argv) {
+    auto input = ally::audio::makeNativeCapture();
+    Sink sink;
+    std::string captureError;
+    ally::audio::CaptureConfig invalid;
+    invalid.bufferFrames = 1;
+    if (input->start(sink, invalid, captureError) || captureError.empty()) {
+        throw std::runtime_error("Invalid capture must fail");
+    }
+    input->stop();
+    input->stop();
+    if (argc > 1 && std::string(argv[1]) == "--capture-probe") {
+        ally::audio::CaptureConfig config;
+        if (argc > 2) {
+            config.deviceId = argv[2];
+        }
+        for (auto device : input->devices(captureError)) {
+            std::cout << "input " << device.id << ": " << device.name << '\n';
+        }
+        if (!input->start(sink, config, captureError)) {
+            throw std::runtime_error(captureError);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        auto stats = input->stats();
+        input->stop();
+        if (!sink.frames.load() || stats.errorCode) {
+            throw std::runtime_error("Capture probe has no frames");
+        }
+        std::cout << "Native input frames=" << sink.frames.load() << " xruns=" << stats.underruns << '\n';
+        return 0;
+    }
     auto backend = ally::audio::makeNativeBackend();
     ally::audio::Engine engine;
     std::string error;

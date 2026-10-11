@@ -35,6 +35,7 @@ struct AudioSource {
     uint32_t originalRate = 48000;
     uint64_t originalFrames = 96000, fingerprint = 0;
     std::shared_ptr<const std::vector<float>> pcm;
+    std::shared_ptr<audio::SampleStream> stream;
     std::array<float, 1024> peaks{};
     std::string error;
     bool operator==(const AudioSource &other) const;
@@ -42,7 +43,13 @@ struct AudioSource {
 struct Track {
     std::string name;
     float gain = 0.65f, cutoff = 16000, attack = .002f, release = .005f;
-    bool muted = false, solo = false;
+    bool muted = false, solo = false, armed = false;
+    audio::Instrument instrument = audio::Instrument::Synth;
+    uint32_t instrumentSource = 1;
+    std::array<uint32_t, 16> drumSources{};
+    uint8_t rootKey = 60, waveform = 0;
+    int inputChannel = 0; // 0 stereo, 1 input left, 2 input right
+    audio::Strip strip{};
     std::vector<Pattern> patterns{Pattern{}};
     uint32_t activePattern = 1;
     std::vector<Clip> clips;
@@ -53,13 +60,18 @@ struct Track {
     bool operator==(const Track &) const = default;
 };
 struct Project {
-    double bpm = 124;
+    static constexpr double maxTimeline = 1024;
+    double bpm = 124, timelineBeats = 32, loopBeats = 24;
+    std::array<audio::Strip, audio::Plan::maxBuses> buses{};
+    std::array<float, audio::Plan::maxBuses> busGains{1, 1, 1, 1};
+    audio::Strip masterStrip{};
     float masterGain = .78f;
     bool masterMuted = false, songMode = true, loop = true, metronome = false;
     std::vector<Track> tracks;
     std::vector<AudioSource> sources;
     bool operator==(const Project &) const = default;
     static Project demo();
+    static Project empty();
     bool valid() const noexcept;
     audio::Plan compile(uint32_t sampleRate) const;
     void save(const std::filesystem::path &path) const;

@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 namespace ally {
+void replaceFile(const std::filesystem::path &temporary, const std::filesystem::path &destination);
 std::string pathText(const std::filesystem::path &path);
 std::filesystem::path textPath(std::string_view value);
 // Same-directory unique temporary file, flush to storage, then OS replacement.

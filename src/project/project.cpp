@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <ally/audio/resample.hpp>
 #include <ally/file.hpp>
+#include <ally/media/stream.hpp>
 #include <ally/media/wav.hpp>
 #include <ally/project.hpp>
+#include <ally/stream.hpp>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -46,44 +49,53 @@ void buildPeaks(AudioSource &source) {
     }
 }
 AudioSource readSource(const std::filesystem::path &path) {
-    // Bound both compressed input and decoded PCM before allocating the prepared stereo buffer.
-    if (std::filesystem::file_size(path) > 64 * 1024 * 1024) {
-        throw std::runtime_error("WAV import exceeds 64 MiB file limit");
-    }
-    auto pcm = media::readWav(path);
-    if (pcm.channels > 2 || !pcm.frames() ||
-        double(pcm.frames()) * 48000 / pcm.sampleRate > 8 * 1024 * 1024) {
-        throw std::runtime_error("Import requires mono/stereo WAV within 64 MiB prepared limit");
+    media::WavReader reader(path);
+    const auto info = reader.info();
+    if (info.channels > 2 || info.frames > uint64_t(info.sampleRate) * 21600) {
+        throw std::runtime_error("Import requires mono/stereo WAV within six hours");
     }
     AudioSource source;
     source.path = std::filesystem::absolute(path).lexically_normal();
-    source.name = pathText(path.filename());
-    if (source.name.size() > 80) {
-        source.name.resize(80);
-    }
-    source.originalRate = pcm.sampleRate;
-    source.originalFrames = pcm.frames();
+    source.name = pathText(path.filename()).substr(0, 80);
+    source.originalRate = info.sampleRate;
+    source.originalFrames = info.frames;
+    const bool stream = double(info.frames) * 48000 / info.sampleRate > 2 * 1024 * 1024;
     uint64_t hash = 14695981039346656037ull;
     auto mix = [&](uint32_t value) {
         for (int i = 0; i < 4; ++i) {
             hash = (hash ^ ((value >> (i * 8)) & 255)) * 1099511628211ull;
         }
     };
-    mix(pcm.sampleRate);
-    mix(pcm.channels);
-    for (float value : pcm.samples) {
-        mix(std::bit_cast<uint32_t>(value));
+    mix(info.sampleRate);
+    mix(info.channels);
+    std::vector<float> stereo;
+    if (!stream) {
+        stereo.reserve(size_t(info.frames) * 2);
+    }
+    for (uint64_t first = 0; first < info.frames; first += 65536) {
+        auto pcm = reader.read(first, 65536);
+        for (size_t i = 0; i < pcm.frames(); ++i) {
+            auto &peak = source.peaks[std::min<size_t>(1023, size_t((first + i) * 1024 / info.frames))];
+            for (size_t ch = 0; ch < pcm.channels; ++ch) {
+                float v = pcm.samples[i * pcm.channels + ch];
+                mix(std::bit_cast<uint32_t>(v));
+                peak = std::max(peak, std::min(1.0f, std::abs(v)));
+            }
+            if (!stream) {
+                stereo.push_back(std::clamp(pcm.samples[i * pcm.channels], -1.0f, 1.0f));
+                stereo.push_back(
+                    std::clamp(pcm.samples[i * pcm.channels + (pcm.channels == 2 ? 1 : 0)], -1.0f, 1.0f));
+            }
+        }
     }
     source.fingerprint = hash;
-    std::vector<float> stereo(pcm.frames() * 2);
-    for (size_t i = 0; i < pcm.frames(); ++i) {
-        stereo[i * 2] = std::clamp(pcm.samples[i * pcm.channels], -1.0f, 1.0f);
-        stereo[i * 2 + 1] =
-            std::clamp(pcm.samples[i * pcm.channels + (pcm.channels == 2 ? 1 : 0)], -1.0f, 1.0f);
+    if (stream) {
+        source.stream = openStream(source.path);
+    } else {
+        source.pcm =
+            std::make_shared<const std::vector<float>>(audio::resampleStereo(stereo, info.sampleRate, 48000));
+        buildPeaks(source);
     }
-    source.pcm =
-        std::make_shared<const std::vector<float>>(audio::resampleStereo(stereo, pcm.sampleRate, 48000));
-    buildPeaks(source);
     return source;
 }
 bool noteValid(const Note &n) {
@@ -139,6 +151,15 @@ const AudioSource *Project::source(uint32_t id) const noexcept {
     }
     return nullptr;
 }
+Project Project::empty() {
+    Project p;
+    p.sources.push_back(textureSource());
+    buildPeaks(p.sources[0]);
+    Track track;
+    track.name = "Instrument 1";
+    p.tracks.push_back(track);
+    return p;
+}
 Project Project::demo() {
     Project p;
     p.sources.push_back(textureSource());
@@ -183,16 +204,26 @@ Project Project::demo() {
 }
 bool Project::valid() const noexcept {
     if (!std::isfinite(bpm) || bpm < 20 || bpm > 300 || tracks.empty() ||
-        tracks.size() > audio::Plan::maxTracks || !std::isfinite(masterGain) || masterGain < 0 ||
-        masterGain > 1 || sources.size() > audio::Plan::sampleCapacity) {
+        tracks.size() > audio::Plan::maxTracks || !std::isfinite(timelineBeats) || timelineBeats < 4 ||
+        timelineBeats > maxTimeline || !std::isfinite(loopBeats) || loopBeats < 4 ||
+        loopBeats > timelineBeats || !audio::validStrip(masterStrip, int(audio::Plan::maxBuses)) ||
+        !std::isfinite(masterGain) || masterGain < 0 || masterGain > 1 ||
+        sources.size() > audio::Plan::sourceCapacity) {
         return false;
+    }
+    for (size_t i = 0; i < buses.size(); ++i) {
+        if (!audio::validStrip(buses[i], int(i + 1)) || !std::isfinite(busGains[i]) || busGains[i] < 0 ||
+            busGains[i] > 1 ||
+            std::any_of(buses[i].sends.begin(), buses[i].sends.end(), [](float v) { return v != 0; })) {
+            return false;
+        }
     }
     size_t bytes = 0;
     for (size_t i = 0; i < sources.size(); ++i) {
         const auto &s = sources[i];
         if (!s.id || s.name.empty() || s.name.size() > 80 || s.originalRate < 8000 ||
             s.originalRate > 384000 || !s.originalFrames ||
-            s.originalFrames > uint64_t(s.originalRate) * 1100 ||
+            s.originalFrames > uint64_t(s.originalRate) * 21600 ||
             (s.path.empty() &&
              (s.id != 1 || s.fingerprint != 0 || s.originalRate != 48000 || s.originalFrames != 96000))) {
             return false;
@@ -212,14 +243,23 @@ bool Project::valid() const noexcept {
     if (bytes > 128 * 1024 * 1024) {
         return false;
     }
-    size_t patternEvents = 0, songEvents = 0, samples = 0;
+    size_t patternEvents = 0, songEvents = 0, samples = 0, storedNotes = 0;
     for (const auto &t : tracks) {
         if (t.name.empty() || t.name.size() > 80 || !std::isfinite(t.gain) || t.gain < 0 || t.gain > 1 ||
             !std::isfinite(t.cutoff) || t.cutoff < 20 || t.cutoff > 20000 || !std::isfinite(t.attack) ||
             t.attack < .001 || t.attack > 2 || !std::isfinite(t.release) || t.release < .001 ||
-            t.release > 2 || t.clips.size() > 32 || t.patterns.empty() || t.patterns.size() > 32 ||
-            !t.findPattern(t.activePattern)) {
+            t.release > 2 || t.clips.size() > 128 || t.patterns.empty() || t.patterns.size() > 32 ||
+            !t.findPattern(t.activePattern) || !audio::validStrip(t.strip) ||
+            t.instrument > audio::Instrument::Drum || t.rootKey > 127 || t.waveform > 2 ||
+            t.inputChannel < 0 || t.inputChannel > 2 ||
+            (t.instrument != audio::Instrument::Synth &&
+             (!source(t.instrumentSource) || source(t.instrumentSource)->stream))) {
             return false;
+        }
+        for (uint32_t id : t.drumSources) {
+            if (id && (!source(id) || source(id)->stream)) {
+                return false;
+            }
         }
         for (size_t i = 0; i < t.patterns.size(); ++i) {
             const auto &p = t.patterns[i];
@@ -233,15 +273,19 @@ bool Project::valid() const noexcept {
                     return false;
                 }
             }
+            storedNotes += p.notes.size();
+            if (storedNotes > 32768) {
+                return false;
+            }
             if (p.id == t.activePattern) {
                 patternEvents += p.notes.size() + size_t(std::count(p.steps.begin(), p.steps.end(), true));
             }
         }
         for (const auto &clip : t.clips) {
             if (clip.name.empty() || clip.name.size() > 80 || !std::isfinite(clip.beat) || clip.beat < 0 ||
-                clip.beat >= 32 || !std::isfinite(clip.length) || clip.length < .25 ||
-                clip.length > 32 - clip.beat || !std::isfinite(clip.sourceOffset) || clip.sourceOffset < 0 ||
-                clip.sourceOffset > 1100) {
+                clip.beat >= timelineBeats || !std::isfinite(clip.length) || clip.length < .25 ||
+                clip.length > timelineBeats - clip.beat || !std::isfinite(clip.sourceOffset) ||
+                clip.sourceOffset < 0 || clip.sourceOffset > 21600) {
                 return false;
             }
             if (clip.audio) {
@@ -269,10 +313,13 @@ audio::Plan Project::compile(uint32_t rate) const {
     }
     audio::Plan plan;
     const double fpb = rate * 60.0 / bpm;
-    plan.loopFrames = uint64_t(std::llround(fpb * (songMode ? 32 : 4)));
-    plan.loopEndFrame = uint64_t(std::llround(fpb * (songMode ? 24 : 4)));
+    plan.loopFrames = uint64_t(std::llround(fpb * (songMode ? timelineBeats : 4)));
+    plan.loopEndFrame = uint64_t(std::llround(fpb * (songMode ? loopBeats : 4)));
     plan.masterGain = masterMuted ? 0 : masterGain;
-    for (int beat = 0; beat < (songMode ? 32 : 4); ++beat) {
+    plan.buses = buses;
+    plan.busGains = busGains;
+    plan.master = masterStrip;
+    for (int beat = 0; beat < (songMode ? timelineBeats : 4); ++beat) {
         plan.clicks[plan.clickCount++] = uint64_t(std::llround(fpb * beat));
     }
     const bool anySolo = std::any_of(tracks.begin(), tracks.end(), [](const Track &t) { return t.solo; });
@@ -281,6 +328,17 @@ audio::Plan Project::compile(uint32_t rate) const {
         const auto &t = tracks[i];
         plan.gains[i] = t.muted || (anySolo && !t.solo) ? 0 : t.gain;
         plan.cutoffs[i] = t.cutoff;
+        plan.strips[i] = t.strip;
+        plan.instruments[i] = t.instrument;
+        plan.roots[i] = t.rootKey;
+        plan.waveforms[i] = t.waveform;
+        if (const auto *s = source(t.instrumentSource)) {
+            plan.instrumentSources[i] = uint32_t(s - sources.data());
+        }
+        for (size_t pad = 0; pad < 16; ++pad) {
+            const auto *source = this->source(t.drumSources[pad] ? t.drumSources[pad] : t.instrumentSource);
+            plan.drumSources[i][pad] = source ? uint32_t(source - sources.data()) : 0;
+        }
         plan.attacks[i] = uint32_t(std::llround(t.attack * rate));
         plan.releases[i] = uint32_t(std::llround(t.release * rate));
         auto pattern = [&](const Pattern &p, double start, double length) {
@@ -339,12 +397,18 @@ audio::Plan Project::prepare(audio::Engine &engine) const {
             pcm = std::make_shared<const std::vector<float>>(
                 audio::resampleStereo(*pcm, 48000, engine.sampleRate()));
         }
+        if (sources[i].stream && engine.sampleRate() != 48000) {
+            throw std::runtime_error("Streaming currently prepares a 48 kHz engine timeline");
+        }
         plan.sources[i] = engine.prepareSample(pcm);
+        plan.streams[i] = engine.prepareStream(sources[i].stream);
     }
+    engine.prefetch(plan, engine.position() % plan.loopFrames, false);
     return plan;
 }
 void Project::importWav(const std::filesystem::path &path, size_t track, double beat) {
-    if (track >= tracks.size() || !std::isfinite(beat) || beat < 0 || beat >= 32 || sources.size() >= 32) {
+    if (track >= tracks.size() || !std::isfinite(beat) || beat < 0 || beat >= maxTimeline ||
+        sources.size() >= 32) {
         throw std::runtime_error("No room for imported audio source");
     }
     auto source = readSource(path);
@@ -359,8 +423,10 @@ void Project::importWav(const std::filesystem::path &path, size_t track, double 
     clip.sourceId = source.id;
     clip.sourceLoop = false;
     clip.beat = beat;
-    clip.length = std::clamp(double(source.pcm->size() / 2) / 48000 * bpm / 60, .25, 32 - beat);
+    clip.length =
+        std::clamp(double(source.originalFrames) / source.originalRate * bpm / 60, .25, maxTimeline - beat);
     Project candidate = *this;
+    candidate.timelineBeats = std::max(candidate.timelineBeats, std::ceil((beat + clip.length) / 4) * 4);
     candidate.sources.push_back(std::move(source));
     candidate.tracks[track].clips.push_back(clip);
     if (!candidate.valid()) {
@@ -392,14 +458,37 @@ std::string Project::sourceWarnings() const {
     }
     return result;
 }
+namespace {
+void writeStrip(std::ostream &out, const audio::Strip &s) {
+    out << s.pan << ' ' << s.lowDb << ' ' << s.midDb << ' ' << s.highDb << ' ' << s.thresholdDb << ' '
+        << s.ratio << ' ' << s.delayWet << ' ' << s.delaySeconds << ' ' << s.feedback << ' ' << s.route;
+    for (float send : s.sends) {
+        out << ' ' << send;
+    }
+    out << '\n';
+}
+void readStrip(std::istream &in, audio::Strip &s) {
+    in >> s.pan >> s.lowDb >> s.midDb >> s.highDb >> s.thresholdDb >> s.ratio >> s.delayWet >>
+        s.delaySeconds >> s.feedback >> s.route;
+    for (float &send : s.sends) {
+        in >> send;
+    }
+}
+} // namespace
 void Project::save(const std::filesystem::path &path) const {
     if (!valid()) {
         throw std::runtime_error("Cannot save invalid project");
     }
     std::ostringstream out;
-    out << std::setprecision(17) << "ALLY_PROJECT 5\n"
+    out << std::setprecision(17) << "ALLY_PROJECT 6\n"
         << songMode << ' ' << bpm << ' ' << tracks.size() << ' ' << masterGain << ' ' << masterMuted << ' '
         << loop << ' ' << metronome << ' ' << sources.size() << '\n';
+    out << timelineBeats << ' ' << loopBeats << '\n';
+    writeStrip(out, masterStrip);
+    for (size_t i = 0; i < buses.size(); ++i) {
+        out << busGains[i] << ' ';
+        writeStrip(out, buses[i]);
+    }
     const auto parent = std::filesystem::absolute(path).parent_path();
     for (const auto &source : sources) {
         auto relative =
@@ -414,6 +503,13 @@ void Project::save(const std::filesystem::path &path) const {
         out << std::quoted(t.name) << ' ' << t.gain << ' ' << t.muted << ' ' << t.solo << ' ' << t.cutoff
             << ' ' << t.attack << ' ' << t.release << ' ' << t.activePattern << ' ' << t.patterns.size()
             << ' ' << t.clips.size() << '\n';
+        out << int(t.instrument) << ' ' << t.instrumentSource << ' ' << int(t.rootKey) << ' '
+            << int(t.waveform) << ' ' << t.armed << ' ' << t.inputChannel << '\n';
+        for (auto id : t.drumSources) {
+            out << id << ' ';
+        }
+        out << '\n';
+        writeStrip(out, t.strip);
         for (const auto &p : t.patterns) {
             out << p.id << ' ' << std::quoted(p.name) << ' ' << p.notes.size() << '\n';
             for (bool step : p.steps) {
@@ -444,7 +540,7 @@ Project Project::load(const std::filesystem::path &path) {
     std::string magic;
     int version = 0;
     in >> magic >> version;
-    if (!((magic == "ALLY_PROJECT" && version >= 2 && version <= 5) ||
+    if (!((magic == "ALLY_PROJECT" && version >= 2 && version <= 6) ||
           (magic == "DAW_PROJECT" && version == 1))) {
         throw std::runtime_error("Unsupported project version");
     }
@@ -461,6 +557,14 @@ Project Project::load(const std::filesystem::path &path) {
     }
     if (version >= 5) {
         in >> sources;
+    }
+    if (version >= 6) {
+        in >> p.timelineBeats >> p.loopBeats;
+        readStrip(in, p.masterStrip);
+        for (size_t i = 0; i < p.buses.size(); ++i) {
+            in >> p.busGains[i];
+            readStrip(in, p.buses[i]);
+        }
     }
     if (!in || !tracks || tracks > audio::Plan::maxTracks || sources > 32) {
         throw std::runtime_error("Invalid document counts");
@@ -498,8 +602,22 @@ Project Project::load(const std::filesystem::path &path) {
                 in >> clips;
             }
         }
-        if (!in || count > audio::Plan::capacity || !patterns || patterns > 32 || clips > 32) {
+        if (!in || count > audio::Plan::capacity || !patterns || patterns > 32 || clips > 128) {
             throw std::runtime_error("Invalid track counts");
+        }
+        if (version >= 6) {
+            int instrument = 0, root = 0, wave = 0;
+            in >> instrument >> t.instrumentSource >> root >> wave >> t.armed >> t.inputChannel;
+            if (instrument < 0 || instrument > 2 || root < 0 || root > 127 || wave < 0 || wave > 2) {
+                throw std::runtime_error("Invalid instrument parameters");
+            }
+            t.instrument = audio::Instrument(instrument);
+            t.rootKey = uint8_t(root);
+            t.waveform = uint8_t(wave);
+            for (auto &id : t.drumSources) {
+                in >> id;
+            }
+            readStrip(in, t.strip);
         }
         t.patterns.resize(patterns);
         for (auto &pattern : t.patterns) {
@@ -595,10 +713,11 @@ Project Project::load(const std::filesystem::path &path) {
                     restored.fingerprint != source.fingerprint) {
                     throw std::runtime_error("File changed; relink explicitly");
                 }
-                if (restored.pcm->size() * sizeof(float) > 128 * 1024 * 1024 - loadedBytes) {
+                if (restored.pcm && restored.pcm->size() * sizeof(float) > 128 * 1024 * 1024 - loadedBytes) {
                     throw std::runtime_error("Project PCM budget exceeded");
                 }
                 source.pcm = restored.pcm;
+                source.stream = restored.stream;
                 source.peaks = restored.peaks;
             } catch (const std::exception &error) {
                 source.error = error.what();
@@ -614,19 +733,43 @@ void renderProject(const Project &project, const std::filesystem::path &path) {
     if (!project.sourceWarnings().empty()) {
         throw std::runtime_error("Cannot export missing/changed audio sources: " + project.sourceWarnings());
     }
+    Project render = project;
+    for (auto &source : render.sources) {
+        if (source.stream) {
+            auto restored = readSource(source.path);
+            if (restored.fingerprint != source.fingerprint || restored.originalRate != source.originalRate ||
+                restored.originalFrames != source.originalFrames) {
+                throw std::runtime_error("Stream source changed before export");
+            }
+            source.stream = restored.stream;
+        }
+    }
     audio::Engine engine(48000);
-    auto plan = project.prepare(engine);
+    auto plan = render.prepare(engine);
     if (!engine.submit(plan)) {
         throw std::runtime_error("Cannot submit render plan");
     }
     engine.looping(false);
     engine.play(true);
-    media::Pcm pcm;
-    pcm.samples.resize(size_t(plan.loopFrames) * 2);
-    for (size_t at = 0; at < pcm.samples.size(); at += 512) {
-        engine.process(std::span(pcm.samples).subspan(at, std::min<size_t>(512, pcm.samples.size() - at)));
+    const auto temporary =
+        path.parent_path() /
+        (path.filename().string() + ".render-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".wav");
+    try {
+        media::WavWriter writer(temporary, 48000, 2);
+        std::array<float, 512> block{};
+        for (uint64_t frame = 0; frame < plan.loopFrames; frame += 256) {
+            engine.prefetch(plan, frame, true);
+            auto output =
+                std::span(block).first(size_t(std::min<uint64_t>(256, plan.loopFrames - frame)) * 2);
+            engine.process(output);
+            writer.append(output);
+        }
+        writer.finish();
+        replaceFile(temporary, path);
+    } catch (...) {
+        std::filesystem::remove(temporary);
+        throw;
     }
-    const auto bytes = media::encodeWav(pcm);
-    atomicWrite(path, {reinterpret_cast<const char *>(bytes.data()), bytes.size()});
 }
 } // namespace ally

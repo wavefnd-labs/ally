@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 project(AllyMedia VERSION 0.1.0 LANGUAGES C CXX)
 include(CTest)
-add_library(ally_media src/container/wav.cpp)
+add_library(ally_media src/container/wav.cpp src/io/stream.cpp)
 add_library(Ally::Media ALIAS ally_media)
 target_compile_features(ally_media PUBLIC cxx_std_23)
 target_include_directories(ally_media PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)

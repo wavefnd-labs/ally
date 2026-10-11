@@ -59,6 +59,33 @@ bool FileLease::acquired() const noexcept {
     return state_->handle >= 0;
 #endif
 }
+void replaceFile(const std::filesystem::path &temporary, const std::filesystem::path &destination) {
+#if defined(_WIN32)
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        throw std::system_error(int(GetLastError()), std::system_category(), "Open render temporary");
+    }
+    bool ok = FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok || !MoveFileExW(temporary.c_str(), destination.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        throw std::system_error(int(GetLastError()), std::system_category(), "Replace rendered file");
+    }
+#else
+    int file = ::open(temporary.c_str(), O_RDONLY | O_CLOEXEC);
+    if (file < 0) {
+        throw std::system_error(errno, std::generic_category(), "Open render temporary");
+    }
+    int rc = ::fsync(file);
+    int error = errno;
+    ::close(file);
+    if (rc) {
+        throw std::system_error(error, std::generic_category(), "Flush rendered file");
+    }
+    std::filesystem::rename(temporary, destination);
+#endif
+}
 void atomicWrite(const std::filesystem::path &path, std::string_view data) {
     static std::atomic<uint64_t> sequence{0};
     auto temp = path;

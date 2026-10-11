@@ -1,10 +1,19 @@
 #include <algorithm>
 #include <ally/audio/engine.hpp>
+#include <chrono>
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
 
 namespace ally::audio {
+bool validStrip(const Strip &s, int firstBus) noexcept {
+    auto range = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+    return range(s.pan, -1, 1) && range(s.lowDb, -24, 24) && range(s.midDb, -24, 24) &&
+           range(s.highDb, -24, 24) && range(s.thresholdDb, -60, 0) && range(s.ratio, 1, 20) &&
+           range(s.delayWet, 0, 1) && range(s.delaySeconds, .01f, 1) && range(s.feedback, 0, .9f) &&
+           (s.route == -1 || (s.route >= firstBus && s.route < int(Plan::maxBuses))) &&
+           std::all_of(s.sends.begin(), s.sends.end(), [&](float v) { return range(v, 0, 1); });
+}
 Engine::Engine(uint32_t sampleRate, std::span<const float> stereoTexture) : sampleRate_(sampleRate) {
     if (stereoTexture.size() % 2 || stereoTexture.size() > size_t(sampleRate) * 240 ||
         !std::all_of(stereoTexture.begin(), stereoTexture.end(),
@@ -14,7 +23,15 @@ Engine::Engine(uint32_t sampleRate, std::span<const float> stereoTexture) : samp
     if (sampleRate < 8000 || sampleRate > 384000) {
         throw std::invalid_argument("Invalid sample rate");
     }
+    plan_ = std::make_unique<Plan>();
+    pendingPlan_ = std::make_unique<Plan>();
     texture_.assign(stereoTexture.begin(), stereoTexture.end());
+    plans_ = std::make_unique<SpscQueue<Plan, 4>>();
+    monitor_ = std::make_unique<SpscQueue<std::array<float, 2>, 16384>>();
+    for (auto &state : dsp_) {
+        state.delay.resize(sampleRate_ + 1);
+    }
+    coefficients();
 }
 
 std::span<const float> Engine::prepareSample(std::shared_ptr<const std::vector<float>> sample) {
@@ -39,8 +56,8 @@ std::span<const float> Engine::prepareSample(std::shared_ptr<const std::vector<f
 
 bool Engine::submit(const Plan &plan) noexcept {
     if (!plan.loopFrames || plan.count > Plan::capacity || plan.sampleCount > Plan::sampleCapacity ||
-        plan.clickCount > 32 || plan.loopEndFrame > plan.loopFrames || !std::isfinite(plan.masterGain) ||
-        plan.masterGain < 0 || plan.masterGain > 1) {
+        plan.clickCount > plan.clicks.size() || plan.loopEndFrame > plan.loopFrames ||
+        !std::isfinite(plan.masterGain) || plan.masterGain < 0 || plan.masterGain > 1) {
         return false;
     }
     for (float gain : plan.gains) {
@@ -52,6 +69,31 @@ bool Engine::submit(const Plan &plan) noexcept {
         if (!std::isfinite(plan.cutoffs[i]) || plan.cutoffs[i] < 20 || plan.cutoffs[i] > 20000 ||
             !plan.attacks[i] || plan.attacks[i] > sampleRate_ * 2 || !plan.releases[i] ||
             plan.releases[i] > sampleRate_ * 2) {
+            return false;
+        }
+    }
+    if (!validStrip(plan.master, int(Plan::maxBuses))) {
+        return false;
+    }
+    for (size_t i = 0; i < Plan::maxBuses; ++i) {
+        if (!validStrip(plan.buses[i], int(i + 1)) || !std::isfinite(plan.busGains[i]) ||
+            plan.busGains[i] < 0 || plan.busGains[i] > 1 ||
+            std::any_of(plan.buses[i].sends.begin(), plan.buses[i].sends.end(),
+                        [](float v) { return v != 0; })) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < Plan::maxTracks; ++i) {
+        if (!validStrip(plan.strips[i]) || plan.instruments[i] > Instrument::Drum || plan.roots[i] > 127 ||
+            plan.waveforms[i] > 2 || plan.instrumentSources[i] >= Plan::sourceCapacity ||
+            std::any_of(plan.drumSources[i].begin(), plan.drumSources[i].end(),
+                        [](uint32_t s) { return s >= Plan::sourceCapacity; })) {
+            return false;
+        }
+    }
+    for (const auto *stream : plan.streams) {
+        if (stream && !std::any_of(streams_.begin(), streams_.end(),
+                                   [&](const auto &s) { return s.get() == stream; })) {
             return false;
         }
     }
@@ -67,7 +109,7 @@ bool Engine::submit(const Plan &plan) noexcept {
     }
     for (uint32_t i = 0; i < plan.sampleCount; ++i) {
         const auto &s = plan.samples[i];
-        if (s.offset > uint64_t(sampleRate_) * 1100 || s.source >= Plan::sampleCapacity ||
+        if (s.offset > uint64_t(sampleRate_) * 21600 || s.source >= Plan::sourceCapacity ||
             s.track >= Plan::maxTracks || s.start >= plan.loopFrames || !s.duration ||
             s.duration > plan.loopFrames - s.start) {
             return false;
@@ -86,11 +128,11 @@ bool Engine::submit(const Plan &plan) noexcept {
             return false;
         }
     }
-    return plans_.push(plan);
+    return plans_->push(plan);
 }
 
 bool Engine::midi(MidiEvent event) noexcept {
-    if (event.key > 127 || event.velocity > 127) {
+    if (event.key > 127 || event.velocity > 127 || event.track >= Plan::maxTracks) {
         return false;
     }
     return midi_.push(event);
@@ -116,45 +158,192 @@ void Engine::trigger(uint8_t key, uint8_t track, float velocity, uint64_t durati
     it->key = key;
     it->track = track;
     it->velocity = velocity;
+    it->source = plan_->instrumentSources[track];
+    if (plan_->instruments[track] == Instrument::Drum) {
+        it->source = plan_->drumSources[track][size_t(key >= 36 && key < 52 ? key - 36 : 0)];
+        if (auto *stream = plan_->streams[it->source]) {
+            it->remaining = it->length = stream->frames();
+        } else if (!plan_->sources[it->source].empty()) {
+            it->remaining = it->length = plan_->sources[it->source].size() / 2;
+        }
+    }
+    it->sampleStep = plan_->instruments[track] == Instrument::Drum
+                         ? 1
+                         : std::exp2((int(key) - int(plan_->roots[track])) / 12.0);
     it->live = live;
     it->audition = audition;
 }
 
+SampleStream *Engine::prepareStream(std::shared_ptr<SampleStream> stream) {
+    if (!stream) {
+        return nullptr;
+    }
+    for (const auto &existing : streams_) {
+        if (existing == stream) {
+            return existing.get();
+        }
+    }
+    if (streams_.size() >= 64) {
+        throw std::runtime_error("Stream lifetime limit: restart to reclaim");
+    }
+    streams_.push_back(std::move(stream));
+    return streams_.back().get();
+}
+uint64_t Engine::timestamp() const noexcept {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    // Read a coherent clock/anchor pair without waiting for the audio owner.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto version = clockVersion_.load();
+        const auto anchor = anchorNs_.load();
+        const auto frame = clock_.load();
+        if (!(version & 1) && version == clockVersion_.load()) {
+            const auto elapsed = anchor ? std::clamp<int64_t>(now - anchor, 0, 50000000) : 0;
+            return frame + uint64_t(elapsed) * sampleRate_ / 1000000000;
+        }
+    }
+    return clock_.load();
+}
+uint64_t Engine::streamUnderruns() const noexcept {
+    uint64_t total = 0;
+    // Called by the UI owner, which also registers sources.
+    for (const auto &s : streams_) {
+        total += s->underruns();
+    }
+    return total;
+}
+void Engine::prefetch(const Plan &plan, uint64_t frame, bool wait) {
+    for (uint32_t i = 0; i < plan.sampleCount; ++i) {
+        const auto &event = plan.samples[i];
+        if (auto *stream = plan.streams[event.source]; stream && frame < event.start + event.duration) {
+            auto at = event.offset + (frame > event.start ? frame - event.start : 0);
+            if (event.loop) {
+                at %= stream->frames();
+            }
+            if (at < stream->frames()) {
+                stream->prefetch(at, wait);
+            }
+        }
+    }
+}
+void Engine::monitorInput(std::span<const float> stereo) noexcept {
+    if (monitorTrack_.load() < 0) {
+        return;
+    }
+    for (size_t i = 0; i + 1 < stereo.size(); i += 2) {
+        if (!monitor_->push({stereo[i], stereo[i + 1]})) {
+            break;
+        }
+    }
+}
+std::array<float, 2> Engine::readSource(uint32_t source, uint64_t frame, bool loop) noexcept {
+    if (auto *stream = plan_->streams[source]) {
+        if (loop) {
+            frame %= stream->frames();
+        }
+        if (frame >= stream->frames()) {
+            return {};
+        }
+        std::array<float, 2> signal{};
+        stream->read(frame, signal[0], signal[1]);
+        return signal;
+    }
+    const auto buffer = plan_->sourcesBound ? plan_->sources[source] : std::span<const float>(texture_);
+    if (buffer.empty() || (!loop && frame >= buffer.size() / 2)) {
+        return {};
+    }
+    const auto at = size_t(frame % (buffer.size() / 2)) * 2;
+    return {buffer[at], buffer[at + 1]};
+}
+void Engine::coefficients() noexcept {
+    for (size_t i = 0; i < dsp_.size(); ++i) {
+        const auto &s = i < Plan::maxTracks                    ? plan_->strips[i]
+                        : i < Plan::maxTracks + Plan::maxBuses ? plan_->buses[i - Plan::maxTracks]
+                                                               : plan_->master;
+        lowGain_[i] = std::pow(10.0f, s.lowDb / 20);
+        midGain_[i] = std::pow(10.0f, s.midDb / 20);
+        highGain_[i] = std::pow(10.0f, s.highDb / 20);
+        thresholds_[i] = std::pow(10.0f, s.thresholdDb / 20);
+    }
+}
+void Engine::resetDsp() noexcept {
+    for (auto &state : dsp_) {
+        state.low = state.high = {};
+        state.envelope = 0;
+        state.cursor = state.delayValid = 0;
+    }
+}
+
+std::array<float, 2> Engine::processStrip(std::array<float, 2> signal, const Strip &s,
+                                          size_t index) noexcept {
+    auto &state = dsp_[index];
+    if (s.lowDb != 0 || s.midDb != 0 || s.highDb != 0) {
+        const float lowAlpha = 1 - std::exp(float(-2 * std::numbers::pi * 250 / sampleRate_));
+        const float highAlpha = 1 - std::exp(float(-2 * std::numbers::pi * 4000 / sampleRate_));
+        for (size_t ch = 0; ch < 2; ++ch) {
+            state.low[ch] += lowAlpha * (signal[ch] - state.low[ch]);
+            state.high[ch] += highAlpha * (signal[ch] - state.high[ch]);
+            signal[ch] = state.low[ch] * lowGain_[index] +
+                         (state.high[ch] - state.low[ch]) * midGain_[index] +
+                         (signal[ch] - state.high[ch]) * highGain_[index];
+        }
+    }
+    if (s.thresholdDb < 0) {
+        float peak = std::max(std::abs(signal[0]), std::abs(signal[1]));
+        const float alpha = peak > state.envelope ? .02f : .0002f;
+        state.envelope += alpha * (peak - state.envelope);
+        if (state.envelope > thresholds_[index]) {
+            const float gain = std::pow(thresholds_[index] / state.envelope, 1 - 1 / s.ratio);
+            signal[0] *= gain;
+            signal[1] *= gain;
+        }
+    }
+    if (s.delayWet > 0) {
+        size_t distance = std::clamp(size_t(s.delaySeconds * sampleRate_), size_t(1), state.delay.size() - 1);
+        auto echo = state.delayValid >= distance
+                        ? state.delay[(state.cursor + state.delay.size() - distance) % state.delay.size()]
+                        : std::array<float, 2>{};
+        state.delay[state.cursor] = {signal[0] + echo[0] * s.feedback, signal[1] + echo[1] * s.feedback};
+        state.cursor = (state.cursor + 1) % state.delay.size();
+        state.delayValid = std::min(state.delayValid + 1, state.delay.size());
+        signal[0] += echo[0] * s.delayWet;
+        signal[1] += echo[1] * s.delayWet;
+    }
+    signal[0] *= std::min(1.0f, 1 - s.pan);
+    signal[1] *= std::min(1.0f, 1 + s.pan);
+    return signal;
+}
+
 void Engine::process(std::span<float> out) noexcept {
-    Plan pending;
+    auto &pending = *pendingPlan_;
     bool changed = false;
-    while (plans_.pop(pending)) {
-        plan_ = pending;
+    while (plans_->pop(pending)) {
+        *plan_ = pending;
         changed = true;
     }
     if (changed) {
         voices_.fill({});
         clickRemaining_ = 0;
-        frame_ %= plan_.loopFrames;
+        coefficients();
+        frame_ %= plan_->loopFrames;
     }
     if (reset_.exchange(false)) {
+        resetDsp();
         frame_ = 0;
         voices_.fill({});
         clickRemaining_ = 0;
     }
     const auto seek = seek_.exchange(std::numeric_limits<uint64_t>::max());
     if (seek != std::numeric_limits<uint64_t>::max()) {
-        frame_ = seek % plan_.loopFrames;
+        resetDsp();
+        frame_ = seek % plan_->loopFrames;
         voices_.fill({});
         clickRemaining_ = 0;
     }
-    MidiEvent event;
-    while (midi_.pop(event)) {
-        if (event.velocity) {
-            trigger(event.key, 0, float(event.velocity) / 127.0f, sampleRate_ * 10, true);
-        } else {
-            for (auto &v : voices_) {
-                if (v.live && !v.audition && v.key == event.key) {
-                    v.remaining = std::min<uint64_t>(v.remaining, 240);
-                }
-            }
-        }
-    }
+    MidiEvent nextMidi = pendingMidi_;
+    bool haveMidi = hasPendingMidi_ || midi_.pop(nextMidi);
+    hasPendingMidi_ = false;
     AuditionEvent preview;
     while (auditions_.pop(preview)) {
         if (preview.velocity) {
@@ -162,7 +351,8 @@ void Engine::process(std::span<float> out) noexcept {
                     true);
         } else {
             for (auto &v : voices_) {
-                if (v.audition && v.key == preview.key && v.track == preview.track) {
+                if (v.audition && v.key == preview.key && v.track == preview.track &&
+                    plan_->instruments[v.track] != Instrument::Drum) {
                     v.remaining = std::min<uint64_t>(v.remaining, 240);
                 }
             }
@@ -175,11 +365,24 @@ void Engine::process(std::span<float> out) noexcept {
     std::array<float, 2> stereoPeaks{};
     std::array<std::array<float, 2>, Plan::maxTracks> trackStereoPeaks{};
     for (size_t i = 0; i + 1 < out.size(); i += 2) {
+        while (haveMidi && nextMidi.sampleTime <= clockFrame_) {
+            if (nextMidi.velocity) {
+                trigger(nextMidi.key, nextMidi.track, float(nextMidi.velocity) / 127, sampleRate_ * 30, true);
+            } else {
+                for (auto &v : voices_) {
+                    if (v.live && !v.audition && v.key == nextMidi.key && v.track == nextMidi.track &&
+                        plan_->instruments[v.track] != Instrument::Drum) {
+                        v.remaining = std::min<uint64_t>(v.remaining, plan_->releases[v.track]);
+                    }
+                }
+            }
+            haveMidi = midi_.pop(nextMidi);
+        }
         if (run) {
             const auto begin =
-                std::lower_bound(plan_.notes.begin(), plan_.notes.begin() + plan_.count, frame_,
+                std::lower_bound(plan_->notes.begin(), plan_->notes.begin() + plan_->count, frame_,
                                  [](const NoteEvent &n, uint64_t f) { return n.start < f; });
-            for (auto it = begin; it != plan_.notes.begin() + plan_.count && it->start == frame_; ++it) {
+            for (auto it = begin; it != plan_->notes.begin() + plan_->count && it->start == frame_; ++it) {
                 trigger(it->key, it->track, it->velocity, it->duration, false);
             }
         }
@@ -189,54 +392,62 @@ void Engine::process(std::span<float> out) noexcept {
             if (!v.remaining || (!run && !v.live)) {
                 continue;
             }
-            const float attack = std::min(1.0f, float(v.age) / plan_.attacks[v.track]);
-            const float release = std::min(1.0f, float(v.remaining) / plan_.releases[v.track]);
-            double wave = std::sin(2.0 * std::numbers::pi * v.phase);
-            if (v.track == 1) {
-                wave += 0.25 * std::sin(4.0 * std::numbers::pi * v.phase);
+            const float attack = std::min(1.0f, float(v.age) / plan_->attacks[v.track]);
+            const float release = std::min(1.0f, float(v.remaining) / plan_->releases[v.track]);
+            std::array<float, 2> signal{};
+            if (plan_->instruments[v.track] == Instrument::Synth) {
+                double wave = std::sin(2 * std::numbers::pi * v.phase);
+                if (plan_->waveforms[v.track] == 1) {
+                    // PolyBLEP saw reduces the discontinuity without per-voice allocations.
+                    double t = v.phase, dt = v.increment, correction = 0;
+                    if (t < dt) {
+                        t /= dt;
+                        correction = t + t - t * t - 1;
+                    } else if (t > 1 - dt) {
+                        t = (t - 1) / dt;
+                        correction = t * t + t + t + 1;
+                    }
+                    wave = 2 * v.phase - 1 - correction;
+                } else if (plan_->waveforms[v.track] == 2) {
+                    wave = 1 - 4 * std::abs(v.phase - .5);
+                }
+                const float alpha =
+                    std::min(1.0f, float(2 * std::numbers::pi * plan_->cutoffs[v.track] / sampleRate_));
+                v.filtered += alpha * (float(wave) - v.filtered);
+                // Keep the established centered instrument stereo balance.
+                signal = {v.filtered * .2f, v.filtered * .14f};
+            } else {
+                const auto at = uint64_t(v.samplePosition);
+                auto a = readSource(v.source, at, false);
+                auto b = readSource(v.source, at + 1, false);
+                const auto fraction = float(v.samplePosition - double(at));
+                signal = {std::lerp(a[0], b[0], fraction), std::lerp(a[1], b[1], fraction)};
+                const float alpha =
+                    std::min(1.0f, float(2 * std::numbers::pi * plan_->cutoffs[v.track] / sampleRate_));
+                v.filtered += alpha * (signal[0] - v.filtered);
+                v.filteredRight += alpha * (signal[1] - v.filteredRight);
+                signal = {v.filtered, v.filteredRight};
+                v.samplePosition += v.sampleStep;
             }
-            if (v.track == 2) {
-                wave *= std::exp(-double(v.age) / (sampleRate_ * 0.07));
+            for (size_t channel = 0; channel < 2; ++channel) {
+                trackSample[v.track][channel] += signal[channel] * v.velocity * attack * release;
             }
-            if (v.track == 3) {
-                wave += 0.15 * std::sin(6.0 * std::numbers::pi * v.phase);
-            }
-            const float alpha =
-                std::min(1.0f, float(2 * std::numbers::pi * plan_.cutoffs[v.track] / sampleRate_));
-            v.filtered += alpha * (float(wave) - v.filtered);
-            float s = v.filtered * v.velocity * attack * release * plan_.gains[v.track] * 0.2f;
-            const float pan = float(v.track) * 0.13f;
-            const float l = s * (1 - pan), r = s * (0.7f + pan);
-            trackSample[v.track][0] += l;
-            trackSample[v.track][1] += r;
-            left += l;
-            right += r;
             v.phase += v.increment;
             v.phase -= std::floor(v.phase);
             ++v.age;
             --v.remaining;
         }
         if (run) {
-            for (uint32_t n = 0; n < plan_.sampleCount; ++n) {
-                const auto &event = plan_.samples[n];
-                const auto buffer =
-                    plan_.sourcesBound ? plan_.sources[event.source] : std::span<const float>(texture_);
-                if (!buffer.empty() && frame_ >= event.start && frame_ - event.start < event.duration) {
-                    const auto sourceFrame = event.offset + frame_ - event.start;
-                    if (!event.loop && sourceFrame >= buffer.size() / 2) {
-                        continue;
-                    }
-                    const size_t at = size_t(sourceFrame % (buffer.size() / 2)) * 2;
-                    float l = buffer[at] * plan_.gains[event.track],
-                          r = buffer[at + 1] * plan_.gains[event.track];
-                    left += l;
-                    right += r;
-                    trackSample[event.track][0] += l;
-                    trackSample[event.track][1] += r;
+            for (uint32_t n = 0; n < plan_->sampleCount; ++n) {
+                const auto &event = plan_->samples[n];
+                if (frame_ >= event.start && frame_ - event.start < event.duration) {
+                    auto signal = readSource(event.source, event.offset + frame_ - event.start, event.loop);
+                    trackSample[event.track][0] += signal[0];
+                    trackSample[event.track][1] += signal[1];
                 }
             }
-            if (click &&
-                std::binary_search(plan_.clicks.begin(), plan_.clicks.begin() + plan_.clickCount, frame_)) {
+            if (click && std::binary_search(plan_->clicks.begin(), plan_->clicks.begin() + plan_->clickCount,
+                                            frame_)) {
                 clickRemaining_ = 960;
             }
         }
@@ -246,26 +457,64 @@ void Engine::process(std::span<float> out) noexcept {
             right += s;
             --clickRemaining_;
         }
+        std::array<float, 2> input{};
+        if (monitor_->pop(input)) {
+            const int target = monitorTrack_.load();
+            if (target >= 0 && target < int(Plan::maxTracks)) {
+                trackSample[size_t(target)][0] += input[0];
+                trackSample[size_t(target)][1] += input[1];
+            }
+        }
+        std::array<std::array<float, 2>, Plan::maxBuses> busSample{};
+        auto route = [&](const std::array<float, 2> &signal, int target) {
+            if (target < 0) {
+                left += signal[0];
+                right += signal[1];
+            } else {
+                busSample[size_t(target)][0] += signal[0];
+                busSample[size_t(target)][1] += signal[1];
+            }
+        };
         for (size_t track = 0; track < Plan::maxTracks; ++track) {
+            auto signal = processStrip(trackSample[track], plan_->strips[track], track);
             for (size_t channel = 0; channel < 2; ++channel) {
-                const float magnitude = std::abs(trackSample[track][channel]);
+                signal[channel] *= plan_->gains[track];
+                const float magnitude = std::abs(signal[channel]);
                 trackStereoPeaks[track][channel] = std::max(trackStereoPeaks[track][channel], magnitude);
                 trackPeaks[track] = std::max(trackPeaks[track], magnitude);
             }
+            route(signal, plan_->strips[track].route);
+            for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
+                if (plan_->strips[track].sends[bus] != 0) {
+                    busSample[bus][0] += signal[0] * plan_->strips[track].sends[bus];
+                    busSample[bus][1] += signal[1] * plan_->strips[track].sends[bus];
+                }
+            }
         }
-        out[i] = std::clamp(left * plan_.masterGain, -1.0f, 1.0f);
-        out[i + 1] = std::clamp(right * plan_.masterGain, -1.0f, 1.0f);
+        // Prepared acyclic order: each bus may only feed a later bus or master.
+        for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
+            auto signal = processStrip(busSample[bus], plan_->buses[bus], Plan::maxTracks + bus);
+            signal[0] *= plan_->busGains[bus];
+            signal[1] *= plan_->busGains[bus];
+            route(signal, plan_->buses[bus].route);
+        }
+        auto master = processStrip({left, right}, plan_->master, Plan::maxTracks + Plan::maxBuses);
+        left = master[0];
+        right = master[1];
+        out[i] = std::clamp(left * plan_->masterGain, -1.0f, 1.0f);
+        out[i + 1] = std::clamp(right * plan_->masterGain, -1.0f, 1.0f);
         peak = std::max({peak, std::abs(out[i]), std::abs(out[i + 1])});
         stereoPeaks[0] = std::max(stereoPeaks[0], std::abs(out[i]));
         stereoPeaks[1] = std::max(stereoPeaks[1], std::abs(out[i + 1]));
+        ++clockFrame_;
         if (run) {
             ++frame_;
-            uint64_t end = loop && plan_.loopEndFrame ? plan_.loopEndFrame : plan_.loopFrames;
+            uint64_t end = loop && plan_->loopEndFrame ? plan_->loopEndFrame : plan_->loopFrames;
             if (frame_ >= end) {
                 if (loop) {
                     frame_ = 0;
                 } else {
-                    frame_ = plan_.loopFrames - 1;
+                    frame_ = plan_->loopFrames - 1;
                     run = false;
                     playing_.store(false);
                 }
@@ -292,6 +541,14 @@ void Engine::process(std::span<float> out) noexcept {
     for (size_t channel = 0; channel < 2; ++channel) {
         stereoPeaks_[channel].store(stereoPeaks[channel]);
     }
+    hasPendingMidi_ = haveMidi;
+    pendingMidi_ = nextMidi;
     publishedFrame_.store(frame_);
+    clockVersion_.fetch_add(1);
+    clock_.store(clockFrame_);
+    anchorNs_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+    clockVersion_.fetch_add(1);
 }
 } // namespace ally::audio

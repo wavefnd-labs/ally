@@ -1,10 +1,12 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <ally/audio/backend.hpp>
+#include <ally/audio/capture.hpp>
 #include <ally/file.hpp>
 #include <ally/media/wav.hpp>
 #include <ally/midi.hpp>
 #include <ally/project.hpp>
+#include <ally/recording.hpp>
 #include <ally/renderer.hpp>
 #include <ally/workspace.hpp>
 #include <chrono>
@@ -62,10 +64,14 @@ int main(int argc, char **argv) {
         ally::audio::BackendConfig audioConfig;
         int frameLimit = 0, windowWidth = 1440, windowHeight = 900;
         std::string initialView = "piano";
-        std::string capture, render, projectPath, inspect;
+        std::string capture, render, projectPath, inspect, recordProbe, inputDevice;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--list-devices") {
+            if (arg == "--record-probe" && i + 1 < argc) {
+                recordProbe = argv[++i];
+            } else if (arg == "--input-device" && i + 1 < argc) {
+                inputDevice = argv[++i];
+            } else if (arg == "--list-devices") {
                 listDevices = true;
             } else if (arg == "--no-recovery") {
                 noRecovery = true;
@@ -111,7 +117,7 @@ int main(int argc, char **argv) {
                        "    [--smoke] [--frames N] [--screenshot file.bmp] [--view "
                        "piano|devices|mixer]\n"
                        "    [--window-size width height] [--list-devices] [--device id] [--buffer frames] "
-                       "[--no-recovery]\n";
+                       "[--no-recovery] [--input-device id] [--record-probe take.wav --frames N]\n";
                 return 0;
             } else {
                 throw std::runtime_error("Unknown or incomplete argument: " + arg);
@@ -134,7 +140,9 @@ int main(int argc, char **argv) {
             }
             return error.empty() ? 0 : 1;
         }
-        auto project = projectPath.empty() ? ally::Project::demo() : ally::Project::load(projectPath);
+        auto project = projectPath.empty()
+                           ? (recordProbe.empty() ? ally::Project::demo() : ally::Project::empty())
+                           : ally::Project::load(projectPath);
         if (!render.empty()) {
             ally::renderProject(project, render);
             std::cout << "Rendered " << render << '\n';
@@ -236,6 +244,16 @@ int main(int argc, char **argv) {
         workspace.action(initialView);
         workspace.sync();
         auto backend = ally::audio::makeNativeBackend();
+        ally::Recorder recorder(engine);
+        auto input = ally::audio::makeNativeCapture();
+        std::string inputError;
+        if (!offline) {
+            workspace.inputDevices = input->devices(inputError);
+        }
+        double takeStartBeat = 0;
+        if (!inputDevice.empty()) {
+            workspace.inputConfig.deviceId = inputDevice;
+        }
         bool device = false;
         if (!offline) {
             std::string error;
@@ -255,6 +273,10 @@ int main(int argc, char **argv) {
         }
         auto mailbox = std::make_shared<DialogMailbox>();
         workspace.requestFile = [&](const std::string &action) {
+            if (action == "record-audio" && !recordProbe.empty()) {
+                workspace.fileSelected(action, ally::textPath(recordProbe));
+                return;
+            }
             if (action == "load" && workspace.modified()) {
                 const auto choice =
                     ask(window.get(), "Ally", "Current project has unsaved changes. Open another project?",
@@ -267,11 +289,14 @@ int main(int argc, char **argv) {
             static const SDL_DialogFileFilter projectFilters[]{{"Ally project", "ally"}};
             static const SDL_DialogFileFilter wavFilters[]{{"WAV audio", "wav"}};
             auto *context = new DialogContext{mailbox, action};
-            const bool wav = action == "import" || action == "relink" || action == "export";
+            const bool wav =
+                action == "import" || action == "relink" || action == "export" || action == "record-audio";
             const auto *filter = wav ? wavFilters : projectFilters;
-            if (action == "save" || action == "saveas" || action == "export") {
+            if (action == "save" || action == "saveas" || action == "export" || action == "record-audio") {
                 SDL_ShowSaveFileDialog(fileDialogResult, context, window.get(), filter, 1,
-                                       action == "export" ? "render.wav" : "session.ally");
+                                       action == "record-audio" ? "take.wav"
+                                       : action == "export"     ? "render.wav"
+                                                                : "session.ally");
             } else {
                 SDL_ShowOpenFileDialog(fileDialogResult, context, window.get(), filter, 1, nullptr, false);
             }
@@ -289,13 +314,131 @@ int main(int argc, char **argv) {
             workspace.status = device ? "Audio output changed" : "Audio start failed: " + error;
             audioConfig = config;
         };
+        workspace.requestMonitor = [&] {
+            if (workspace.recordingAudio) {
+                workspace.status = "Stop recording before changing monitoring";
+                return;
+            }
+            input->stop();
+            workspace.monitoring = !workspace.monitoring;
+            recorder.monitor(workspace.monitoring ? workspace.selectedTrack() : -1,
+                             workspace.selectedInputChannel());
+            if (workspace.monitoring) {
+                std::string error;
+                if (!input->start(recorder, workspace.inputConfig, error)) {
+                    workspace.monitoring = false;
+                    recorder.monitor(-1);
+                    workspace.status = "Input unavailable: " + error;
+                } else {
+                    workspace.status = "Input monitoring enabled";
+                }
+            } else {
+                workspace.status = "Input monitoring disabled";
+            }
+        };
+        workspace.requestInput = [&](const ally::audio::CaptureConfig &config) {
+            if (workspace.recordingAudio) {
+                workspace.status = "Stop recording before changing input device";
+                return;
+            }
+            input->stop();
+            if (workspace.monitoring) {
+                std::string error;
+                if (!input->start(recorder, config, error)) {
+                    workspace.monitoring = false;
+                    recorder.monitor(-1);
+                    workspace.status = "Input unavailable: " + error;
+                }
+            }
+        };
+        workspace.requestRecord = [&] {
+            if (workspace.recordingAudio) {
+                input->stop();
+                workspace.recordingAudio = false;
+                try {
+                    auto files = recorder.finish();
+                    engine.play(false);
+                    workspace.recorded(std::move(files), takeStartBeat, recorder.lostFrames());
+                    if (recorder.lostFrames()) {
+                        workspace.status = "Recording lost " + std::to_string(recorder.lostFrames()) +
+                                           " frames; silence inserted";
+                    }
+                } catch (const std::exception &e) {
+                    workspace.status = e.what();
+                }
+                if (workspace.monitoring) {
+                    std::string error;
+                    input->start(recorder, workspace.inputConfig, error);
+                }
+                return;
+            }
+            if (workspace.recordingMidi) {
+                workspace.finishMidi();
+                return;
+            }
+            if (!std::any_of(project.tracks.begin(), project.tracks.end(),
+                             [](const auto &t) { return t.armed; })) {
+                workspace.status = "Arm one or more tracks before recording";
+                return;
+            }
+            workspace.action("record-audio");
+        };
+        workspace.startAudioTake = [&](const std::filesystem::path &base) {
+            try {
+                input->stop();
+                std::vector<ally::RecordRoute> routes;
+                for (size_t i = 0; i < project.tracks.size(); ++i) {
+                    if (project.tracks[i].armed) {
+                        auto path = base.parent_path() /
+                                    (ally::pathText(base.stem()) + "-track" + std::to_string(i + 1) + ".wav");
+                        if (std::filesystem::exists(path)) {
+                            throw std::runtime_error("Recording destination exists: " + ally::pathText(path));
+                        }
+                        routes.push_back({i, project.tracks[i].inputChannel, path});
+                    }
+                }
+                if (routes.empty()) {
+                    throw std::runtime_error("No armed recording tracks");
+                }
+                recorder.start(std::move(routes));
+                std::string error;
+                if (!input->start(recorder, workspace.inputConfig, error)) {
+                    recorder.finish();
+                    throw std::runtime_error("Native input failed: " + error);
+                }
+                takeStartBeat = double(engine.position()) / (engine.sampleRate() * 60 / project.bpm);
+                workspace.recordingAudio = true;
+                engine.play(true);
+                workspace.status = "Recording armed tracks";
+            } catch (const std::exception &e) {
+                workspace.status = e.what();
+            }
+        };
         if (!project.sourceWarnings().empty()) {
             workspace.status = project.sourceWarnings();
         }
         ally::midi::Input midi(engine);
         workspace.midiStatus = offline ? "MIDI device probing disabled in offline mode" : midi.connectFirst();
+        if (!offline) {
+            try {
+                workspace.midiPorts = midi.ports();
+            } catch (const std::exception &e) {
+                workspace.midiStatus = e.what();
+            }
+        }
+        workspace.requestMidi = [&](size_t port) { workspace.midiStatus = midi.connect(port); };
         std::cout << "Renderer: SDL3 / Skia Ganesh OpenGL\nAudio: " << workspace.backendStatus << '\n'
                   << workspace.midiStatus << '\n';
+        if (!recordProbe.empty()) {
+            if (offline || frameLimit < 50) {
+                throw std::runtime_error("Record probe requires native audio and --frames >= 50");
+            }
+            workspace.action("arm0");
+            workspace.action("record");
+            if (!workspace.recordingAudio) {
+                throw std::runtime_error("Record probe start failed: " + workspace.status);
+            }
+        }
         if (autoplay) {
             engine.play(true);
         }
@@ -333,7 +476,8 @@ int main(int argc, char **argv) {
                 } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
                     workspace.release();
                 } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-                    workspace.press(event.button.x, event.button.y, event.button.button == SDL_BUTTON_RIGHT);
+                    workspace.press(event.button.x, event.button.y, event.button.button == SDL_BUTTON_RIGHT,
+                                    SDL_GetModState() & SDL_KMOD_SHIFT);
                 } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
                     workspace.move(event.motion.x, event.motion.y);
                 } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
@@ -362,6 +506,28 @@ int main(int argc, char **argv) {
                     } else if (key == SDLK_F9) {
                         workspace.action("mixer");
                     } else if (event.key.mod & SDL_KMOD_CTRL) {
+                        if (key == SDLK_A) {
+                            workspace.action("select-all");
+                        }
+                        if (key == SDLK_C) {
+                            workspace.action("copy");
+                        }
+                        if (key == SDLK_V) {
+                            workspace.action("paste");
+                        }
+                        if (key == SDLK_X) {
+                            workspace.action("cut");
+                        }
+                        if (key == SDLK_D) {
+                            workspace.action("duplicate");
+                        }
+                        if (key == SDLK_N) {
+                            if (!workspace.modified() ||
+                                ask(window.get(), "Ally", "Create a new project and discard current changes?",
+                                    "New project", "Keep project") == 1) {
+                                workspace.action("new-project");
+                            }
+                        }
                         if (key == SDLK_Z) {
                             workspace.action(event.key.mod & SDL_KMOD_SHIFT ? "redo" : "undo");
                         }
@@ -383,6 +549,17 @@ int main(int argc, char **argv) {
                         if (key == SDLK_E) {
                             workspace.action("export");
                         }
+                    } else if (key == SDLK_DELETE || key == SDLK_BACKSPACE) {
+                        workspace.action("delete");
+                    } else if (key == SDLK_R) {
+                        workspace.action(event.key.mod & SDL_KMOD_SHIFT ? "record-midi" : "record");
+                    } else if (key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_UP || key == SDLK_DOWN) {
+                        int direction = key == SDLK_LEFT    ? -1
+                                        : key == SDLK_RIGHT ? 1
+                                        : key == SDLK_UP    ? 2
+                                                            : -2;
+                        workspace.action(std::string(event.key.mod & SDL_KMOD_ALT ? "resize:" : "nudge:") +
+                                         std::to_string(direction));
                     }
                 }
             }
@@ -401,6 +578,29 @@ int main(int argc, char **argv) {
                 if (!result.error.empty()) {
                     workspace.status = "File dialog failed: " + result.error;
                 }
+            }
+            midi.route(uint8_t(workspace.selectedTrack()));
+            workspace.midiDropped = midi.dropped();
+            ally::midi::Message midiEvent;
+            while (midi.poll(midiEvent)) {
+                workspace.midiMessage(midiEvent);
+            }
+            if (workspace.monitoring) {
+                recorder.monitor(workspace.selectedTrack(), workspace.selectedInputChannel());
+            }
+            if ((workspace.recordingAudio || workspace.monitoring) && !input->stats().active) {
+                if (workspace.recordingAudio) {
+                    workspace.requestRecord();
+                }
+                workspace.monitoring = false;
+                recorder.monitor(-1);
+                workspace.status = "Audio input stopped unexpectedly";
+            }
+            if ((workspace.recordingAudio || workspace.recordingMidi) && !engine.playing()) {
+                workspace.action("stop");
+            }
+            if (closePending && (workspace.recordingAudio || workspace.recordingMidi)) {
+                workspace.action("stop");
             }
             workspace.tick(double(SDL_GetTicks()) / 1000);
             workspace.audioStats = backend->stats();
@@ -479,6 +679,9 @@ int main(int argc, char **argv) {
                 close.window.windowID = SDL_GetWindowID(window.get());
                 SDL_PushEvent(&close);
             }
+            if (!recordProbe.empty() && frames == 35) {
+                workspace.action("stop");
+            }
             ++frames;
             if (frameLimit > 0 && frames >= frameLimit) {
                 running = false;
@@ -489,6 +692,21 @@ int main(int argc, char **argv) {
             renderer.screenshot(capture);
             std::cout << "GPU screenshot: " << capture << '\n';
         }
+        if (!recordProbe.empty()) {
+            if (workspace.busy() || project.tracks[0].clips.empty() ||
+                !project.tracks[0].clips.back().audio) {
+                throw std::runtime_error("Recording was not imported into the native workspace: " +
+                                         workspace.status);
+            }
+            std::cout << "Native record/import probe: " << recorder.capturedFrames()
+                      << " frames, lost=" << recorder.lostFrames() << '\n';
+        }
+        input->stop();
+        if (workspace.recordingAudio) {
+            workspace.recordingAudio = false;
+            recorder.finish();
+        }
+        workspace.finishMidi();
         const auto diagnostics = backend->stats();
         backend->stop();
         if (device) {
