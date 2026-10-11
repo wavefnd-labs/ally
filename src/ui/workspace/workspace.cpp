@@ -3,7 +3,11 @@
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
+#include <ally/file.hpp>
+#include <ally/media/wav.hpp>
 #include <ally/workspace.hpp>
+#include <chrono>
+#include <thread>
 #if defined(__linux__)
 #include "include/ports/SkFontMgr_fontconfig.h"
 #elif defined(__APPLE__)
@@ -229,7 +233,99 @@ std::string number(double n) {
 }
 } // namespace
 Workspace::Workspace(Project &p, audio::Engine &e, std::span<const float> texture)
-    : project_(p), engine_(e), texture_(texture) {}
+    : project_(p), document_(p), engine_(e), texture_(texture) {}
+void Workspace::setDocument(const std::filesystem::path &path, const std::filesystem::path &recovery,
+                            bool recovered) {
+    document_ = DocumentSession(project_, path, recovery);
+    if (recovered) {
+        document_.recovered();
+    }
+}
+std::string Workspace::title() const {
+    return "Ally | " +
+           (document_.path().empty() ? std::string("Untitled") : pathText(document_.path().filename())) +
+           (modified() ? " *" : "");
+}
+void Workspace::fileSelected(const std::string &act, const std::filesystem::path &path) {
+    dialogPending_ = false;
+    if (path.empty()) {
+        status = "Cancelled";
+        return;
+    }
+    if (job_.valid()) {
+        return;
+    }
+    release();
+    const auto snapshot = project_;
+    const auto track = size_t(selected_);
+    const auto relink = relinkId_;
+    job_ = std::async(std::launch::async, [snapshot, path, act, track, relink]() mutable {
+        FileResult result{act, path, snapshot};
+        if (act == "save" || act == "saveas") {
+            result.project.save(path);
+        } else if (act == "load") {
+            result.project = Project::load(path);
+        } else if (act == "import") {
+            double beat = 0;
+            for (const auto &clip : result.project.tracks[track].clips) {
+                beat = std::max(beat, clip.beat + clip.length);
+            }
+            if (beat >= 32) {
+                throw std::runtime_error("Selected track has no room after its clips; choose an empty track");
+            }
+            result.project.importWav(path, track, beat);
+        } else if (act == "relink") {
+            result.project.relinkSource(relink, path);
+        } else if (act == "export") {
+            renderProject(result.project, path);
+        }
+        return result;
+    });
+    status = "Working: " + act + " " + pathText(path.filename());
+}
+void Workspace::tick(double seconds) {
+    if (job_.valid() && job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            auto result = job_.get();
+            if (result.action == "save" || result.action == "saveas") {
+                document_.saved(result.project, result.path);
+            } else if (result.action != "export") {
+                // Prepare ownership before swapping the document; failure keeps the previous project.
+                result.project.prepare(engine_);
+                remember(project_);
+                project_ = std::move(result.project);
+                if (result.action == "load") {
+                    engine_.play(false);
+                    engine_.rewind();
+                    document_.opened(project_, result.path);
+                    undo_.clear();
+                    redo_.clear();
+                    selected_ = selectedClip_ = 0;
+                } else if (result.action == "import") {
+                    selectedClip_ = int(project_.tracks[size_t(selected_)].clips.size()) - 1;
+                }
+                selectedNote_ = -1;
+                changed();
+            }
+            status = "Completed: " + result.action + " " + pathText(result.path.filename());
+            auto warnings = project_.sourceWarnings();
+            if (!warnings.empty()) {
+                status = "Missing/changed source: " + warnings;
+            }
+        } catch (const std::exception &error) {
+            status = error.what();
+        }
+    }
+    if (!busy()) {
+        try {
+            if (document_.autosave(project_, seconds)) {
+                status = "Recovery snapshot saved";
+            }
+        } catch (const std::exception &error) {
+            status = "Autosave failed: " + std::string(error.what());
+        }
+    }
+}
 void Workspace::remember(const Project &p) {
     if (undo_.size() == 64) {
         undo_.erase(undo_.begin());
@@ -259,8 +355,14 @@ bool Workspace::sync() {
     if (releaseKey_ >= 0 && engine_.audition({uint8_t(releaseKey_), uint8_t(releaseTrack_), 0})) {
         releaseKey_ = -1;
     }
-    if (dirty_ && project_.valid() && engine_.submit(project_.compile(engine_.sampleRate()))) {
-        dirty_ = false;
+    if (dirty_ && project_.valid()) {
+        try {
+            if (engine_.submit(project_.prepare(engine_))) {
+                dirty_ = false;
+            }
+        } catch (const std::exception &error) {
+            status = error.what();
+        }
     }
     return !dirty_;
 }
@@ -346,8 +448,12 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
                                                                                             : 0xff7aaf8e);
         text(c, "48 kHz · Stereo", w - 220, 33, 10, 0xffa7adab);
     }
+    if (w > 1100) {
+        buttons_.push_back(
+            {{w - 235, 12, 115, 34}, "audio-settings", "Audio device, buffer and diagnostics", true});
+    }
     tool(c, {w - 115, 14.5, 53, 29}, "Export", "export", false, true, "Export WAV");
-    tool(c, {w - 57, 14.5, 44, 29}, "Save", "save", false, true, "Save session.ally");
+    tool(c, {w - 57, 14.5, 44, 29}, "Save", "save", false, true, "Save project (Ctrl+Shift+S: Save As)");
     float browserW = browser_ ? (w <= 1100 ? 175.0f : 205.0f) : 0;
     float bottom = h - 23;
     if (browser_) {
@@ -394,8 +500,11 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
                             "Switch detail editor",
                             true});
     }
-    std::string selection = project_.tracks[size_t(selected_)].name;
-    text(c, selection, w - 47 - std::min(180.0f, float(selection.size() * 6)), dy + 21, 10, 0xffaeb2af);
+    const auto &track = project_.tracks[size_t(selected_)];
+    std::string selection = focus_ == Focus::PatternName ? editText_ : track.pattern().name;
+    const float selectorW = std::min(150.0f, std::max(85.0f, width - 322));
+    tool(c, {w - 52 - selectorW, dy + 5, selectorW, 24}, selection, "patterns", patternMenu_, true,
+         "Select/create/duplicate/rename pattern; assign to selected clip");
     tool(c, {w - 45, dy + 5, 23, 24}, "Q", "quantize", false, detail_ == Detail::Piano, "Quantize notes");
     tool(c, {w - 23, dy + 5, 21, 24}, "⌄", "fold", false, true, "Collapse / expand editor");
     Rect detail{left, dy + 34, width, detailH - 34};
@@ -403,7 +512,13 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     c.clipRect(SkRect::MakeXYWH(detail.x, detail.y, detail.w, detail.h));
     hitClip_ = detail;
     if (detail_ == Detail::Piano) {
-        piano(c, detail, std::fmod(beat, 4));
+        const auto &selectedClips = project_.tracks[size_t(selected_)].clips;
+        if (selectedClip_ >= 0 && selectedClip_ < int(selectedClips.size()) &&
+            selectedClips[size_t(selectedClip_)].audio) {
+            audioClip(c, detail);
+        } else {
+            piano(c, detail, std::fmod(beat, 4));
+        }
     } else if (detail_ == Detail::Devices) {
         devices(c, detail);
     } else {
@@ -417,6 +532,14 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     text(c, status.substr(0, 95), 25, h - 7, 10, 0xff8f9794);
     text(c, backendStatus, w - std::min(300.0f, float(backendStatus.size() * 5.2)) - 11, h - 7, 10,
          0xff8f9794);
+    buttons_.push_back(
+        {{w - 310, bottom, 310, 23}, "audio-settings", "Audio settings / xrun diagnostics", true});
+    menu(c);
+    if (busy()) {
+        box(c, {w / 2 - 170, h / 2 - 22, 340, 44}, head);
+        outline(c, {w / 2 - 170, h / 2 - 22, 340, 44});
+        centered(c, "File operation in progress…", {w / 2 - 170, h / 2 - 22, 340, 44}, 12);
+    }
     for (const auto &b : buttons_) {
         if (b.rect.contains(mouseX_, mouseY_) && !b.tooltip.empty()) {
             float tw = std::min(w - 10, float(b.tooltip.size() * 6 + 14));
@@ -473,7 +596,7 @@ void Workspace::browser(SkCanvas &c, Rect r) {
         }
     }
     entry("Audio Effects", "effects", false, false, false, "record");
-    entry("Samples", "track3", false, false, project_.tracks.size() > 3, "◴");
+    entry("Samples", "import", false, false, true, "◴");
     entry("Plugins", "plugins", false, false, false, "⬡");
     entry("Projects", "load", false, false, true, "browser");
     float foot = r.y + r.h - 31;
@@ -565,22 +688,27 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
             c.save();
             c.clipRect(SkRect::MakeXYWH(cr.x, cr.y, cr.w, cr.h));
             text(c, clip.name, cr.x + 7, cr.y + 14, 10, 0xff171a1b, true);
-            if (clip.audio && !texture_.empty()) {
-                float top = cr.y + 24, wh = cr.h - 37;
-                for (int px = 0; px < int(cr.w) - 10; px += 3) {
-                    size_t at = size_t(double(px) / std::max(1.0f, cr.w - 10) * (texture_.size() / 2));
-                    float peak = 0;
-                    for (size_t j = at; j < std::min(at + texture_.size() / std::max<size_t>(1, size_t(cr.w)),
-                                                     texture_.size() / 2);
-                         ++j) {
-                        peak = std::max(peak, std::abs(texture_[j * 2]));
+            if (clip.audio) {
+                const auto *source = project_.source(clip.sourceId);
+                if (source && source->pcm) {
+                    const double duration = double(source->pcm->size() / 2) / 48000;
+                    for (int px = 0; px < int(cr.w) - 10; px += 3) {
+                        const double seconds = clip.sourceOffset + double(px) / std::max(1.0f, cr.w - 10) *
+                                                                       clip.length * 60 / project_.bpm;
+                        if (!clip.sourceLoop && seconds >= duration) {
+                            continue;
+                        }
+                        const auto bin =
+                            std::min<size_t>(1023, size_t(std::fmod(seconds, duration) / duration * 1024));
+                        const float hh = std::clamp(source->peaks[bin] * 2, .03f, 1.0f) * (cr.h - 37);
+                        line(c, cr.x + 5 + px, cr.y + 24 + (cr.h - 37 - hh) / 2, cr.x + 5 + px,
+                             cr.y + 24 + (cr.h - 37 + hh) / 2, 0xa0283334);
                     }
-                    float hh = std::clamp(peak * 6, .08f, 1.0f) * wh;
-                    line(c, cr.x + 5 + px, top + (wh - hh) / 2, cr.x + 5 + px, top + (wh + hh) / 2,
-                         0xa0283334);
+                } else {
+                    text(c, "Source unavailable - relink", cr.x + 7, cr.y + 40, 10, 0xff57372d);
                 }
-            } else {
-                for (const auto &note : t.notes) {
+            } else if (const auto *pattern = t.findPattern(clip.patternId)) {
+                for (const auto &note : pattern->notes) {
                     float nx = cr.x + 5 + float(note.beat / 4) * (cr.w - 10),
                           ny = cr.y + 29 + float((72 - note.key + 24) % 12) / 12 * 27;
                     box(c, {nx, ny, std::max(2.0f, float(note.length / 4) * (cr.w - 10)), 3}, 0x88273132);
@@ -611,6 +739,103 @@ void Workspace::arrangement(SkCanvas &c, Rect r, double beat) {
     marker.lineTo(ph, viewport.y + 6);
     marker.close();
     c.drawPath(marker, p);
+}
+
+void Workspace::menu(SkCanvas &c) {
+    if (!patternMenu_ && !audioMenu_) {
+        return;
+    }
+    const float width = std::min(410.0f, width_ - 20);
+    const float height = audioMenu_ ? 430 : 370;
+    Rect r{width_ - width - 10,
+           std::clamp(audioMenu_ ? 60.0f : divider_.y - height, 62.0f, height_ - height - 30), width, height};
+    box(c, r, head);
+    outline(c, r, 0xff656661);
+    hitClip_ = {0, 0, width_, height_};
+    if (patternMenu_) {
+        const auto &track = project_.tracks[size_t(selected_)];
+        text(c, track.name + " / Patterns", r.x + 12, r.y + 20, 11, ink, true);
+        const auto begin = size_t(std::max(0, patternPage_)) * 8;
+        for (size_t i = begin; i < std::min(begin + 8, track.patterns.size()); ++i) {
+            tool(c, {r.x + 8, r.y + 30 + float(i - begin) * 25, width - 16, 24}, track.patterns[i].name,
+                 "select-pattern:" + std::to_string(track.patterns[i].id),
+                 track.activePattern == track.patterns[i].id, true, "Edit this independent pattern");
+        }
+        tool(c, {r.x + 8, r.y + 230, width - 16, 24}, "Next page", "pattern-page", false,
+             track.patterns.size() > 8);
+        tool(c, {r.x + 8, r.y + 256, (width - 24) / 2, 24}, "New", "new-pattern", false,
+             track.patterns.size() < 32);
+        tool(c, {r.x + 16 + (width - 24) / 2, r.y + 256, (width - 24) / 2, 24}, "Duplicate",
+             "duplicate-pattern", false, track.patterns.size() < 32);
+        tool(c, {r.x + 8, r.y + 283, width - 16, 24}, "Rename", "rename-pattern");
+        const bool midiClip = selectedClip_ >= 0 && selectedClip_ < int(track.clips.size()) &&
+                              !track.clips[size_t(selectedClip_)].audio;
+        tool(c, {r.x + 8, r.y + 310, width - 16, 24}, "Assign pattern to selected clip", "assign-pattern",
+             false, midiClip);
+        tool(c, {r.x + width - 75, r.y + 340, 66, 23}, "Close", "patterns");
+    } else {
+        text(c, "AUDIO OUTPUT", r.x + 12, r.y + 20, 11, ink, true);
+        const auto begin = size_t(std::max(0, devicePage_)) * 8;
+        for (size_t i = begin; i < std::min(begin + 8, audioDevices.size()); ++i) {
+            tool(c, {r.x + 8, r.y + 30 + float(i - begin) * 25, width - 16, 24},
+                 audioDevices[i].name.substr(0, 57), "device:" + audioDevices[i].id,
+                 audioConfig.deviceId == audioDevices[i].id, true, audioDevices[i].id);
+        }
+        tool(c, {r.x + 8, r.y + 230, width - 16, 24}, "Next devices", "device-page", false,
+             audioDevices.size() > 8);
+        text(c, "Requested buffer (device may round)", r.x + 12, r.y + 275, 10, dim);
+        for (int i = 0; i < 4; ++i) {
+            auto frames = 128u << i;
+            tool(c, {r.x + 8 + float(i) * (width - 16) / 4, r.y + 285, (width - 20) / 4, 24},
+                 std::to_string(frames), "buffer:" + std::to_string(frames),
+                 audioConfig.bufferFrames == frames);
+        }
+        text(c,
+             "Device buffer: " + std::to_string(audioStats.bufferFrames) + " frames / latency " +
+                 number(audioStats.outputLatencyMs) + " ms",
+             r.x + 12, r.y + 331, 10);
+        text(c,
+             "XRUNs: " + std::to_string(audioStats.underruns) + " / process max " +
+                 number(double(audioStats.maxProcessNs) / 1e6) + " ms",
+             r.x + 12, r.y + 352, 10);
+        text(c,
+             "Frames: " + std::to_string(audioStats.processedFrames) +
+                 " / native error: " + std::to_string(audioStats.errorCode),
+             r.x + 12, r.y + 373, 10, dim);
+        tool(c, {r.x + width - 75, r.y + 393, 66, 24}, "Close", "audio-settings");
+    }
+}
+void Workspace::audioClip(SkCanvas &c, Rect r) {
+    const auto &clip = project_.tracks[size_t(selected_)].clips[size_t(selectedClip_)];
+    const auto *source = project_.source(clip.sourceId);
+    box(c, r, panel);
+    if (!source) {
+        return;
+    }
+    text(c, source->name + " / " + std::to_string(source->originalRate) + " Hz", r.x + 12, r.y + 20, 11, ink,
+         true);
+    tool(c, {r.x + 12, r.y + 29, 160, 25},
+         "Start: " +
+             (focus_ == Focus::SourceOffset ? editText_ : std::to_string(clip.sourceOffset).substr(0, 8)) +
+             " s",
+         "source-offset", false, true, "Trim by source offset; arrangement right edge sets end");
+    tool(c, {r.x + 180, r.y + 29, 65, 25}, "Loop", "source-loop", clip.sourceLoop);
+    tool(c, {r.x + 253, r.y + 29, 76, 25}, "Relink", "relink", false, !source->path.empty());
+    Rect wave{r.x + 12, r.y + 65, r.w - 24, std::max(15.0f, r.h - 88)};
+    box(c, wave, bg);
+    if (!source->error.empty()) {
+        text(c, source->error.substr(0, 100), wave.x + 10, wave.y + 23, 11, 0xffd97f7b);
+    } else {
+        for (int x = 0; x < int(wave.w); ++x) {
+            auto peak = source->peaks[std::min<size_t>(1023, size_t(double(x) / wave.w * 1024))];
+            const float height = std::min(1.0f, peak * 2) * wave.h * .85f;
+            line(c, wave.x + x, wave.y + (wave.h - height) / 2, wave.x + x, wave.y + (wave.h + height) / 2,
+                 colors[size_t(selected_)]);
+        }
+        const double duration = double(source->originalFrames) / source->originalRate;
+        const float at = wave.x + float(clip.sourceOffset / duration) * wave.w;
+        line(c, at, wave.y, at, wave.y + wave.h, gold, 2);
+    }
 }
 
 void Workspace::piano(SkCanvas &c, Rect r, double beat) {
@@ -645,8 +870,8 @@ void Workspace::piano(SkCanvas &c, Rect r, double beat) {
         line(c, x, r.y, x, r.y + grid_.h, k % 4 == 0 ? 0xff4e5252 : 0xff333839);
     }
     box(c, {grid_.x, grid_.y + grid_.h / 2, grid_.w, grid_.h / 2}, 0x22111111);
-    for (size_t i = 0; i < project_.tracks[size_t(selected_)].notes.size(); ++i) {
-        const auto &n = project_.tracks[size_t(selected_)].notes[i];
+    for (size_t i = 0; i < project_.tracks[size_t(selected_)].pattern().notes.size(); ++i) {
+        const auto &n = project_.tracks[size_t(selected_)].pattern().notes[i];
         if (n.key > topKey_ || n.key < topKey_ - 12) {
             continue;
         }
@@ -670,7 +895,7 @@ void Workspace::piano(SkCanvas &c, Rect r, double beat) {
         float x = grid_.x + float(k * .5 - scrollBeat_) * bw;
         line(c, x, velocity_.y, x, velocity_.y + velH, 0xff3b4040);
     }
-    for (const auto &n : project_.tracks[size_t(selected_)].notes) {
+    for (const auto &n : project_.tracks[size_t(selected_)].pattern().notes) {
         float x = grid_.x + float(n.beat - scrollBeat_) * bw, hh = n.velocity * (velH - 10);
         box(c, {x + 2, velocity_.y + velH - 5 - hh, 3, hh}, 0xffd9ac78);
     }
@@ -764,6 +989,9 @@ void Workspace::mixer(SkCanvas &c, Rect r) {
 
 void Workspace::action(const std::string &act) {
     try {
+        if (busy()) {
+            return;
+        }
         if (act == "play") {
             engine_.play(!engine_.playing());
             status = engine_.playing() ? "Playing" : "Paused";
@@ -817,24 +1045,72 @@ void Workspace::action(const std::string &act) {
             focus_ = Focus::None;
             return;
         }
-        if (act == "save") {
-            project_.save("session.ally");
-            status = "Saved session.ally";
+        if (act == "save" || act == "saveas" || act == "load" || act == "export" || act == "import" ||
+            act == "relink") {
+            if (act == "relink") {
+                auto &clips = project_.tracks[size_t(selected_)].clips;
+                if (selectedClip_ < 0 || selectedClip_ >= int(clips.size()) ||
+                    !clips[size_t(selectedClip_)].audio) {
+                    return;
+                }
+                relinkId_ = clips[size_t(selectedClip_)].sourceId;
+            }
+            if (act == "save" && !document_.path().empty()) {
+                fileSelected(act, document_.path());
+            } else if (requestFile) {
+                dialogPending_ = true;
+                status = "Choose file: " + act;
+                requestFile(act);
+            } else {
+                status = "File dialog unavailable";
+            }
             return;
         }
-        if (act == "export") {
-            renderProject(project_, "render.wav");
-            status = "Exported render.wav · 8 bars / 48 kHz";
+        if (act == "pattern-page") {
+            patternPage_ =
+                (patternPage_ + 1) % int((project_.tracks[size_t(selected_)].patterns.size() + 7) / 8);
             return;
         }
-        if (act == "load") {
-            auto loaded = Project::load("session.ally");
-            remember(project_);
-            project_ = std::move(loaded);
-            selected_ = selectedClip_ = 0;
-            selectedNote_ = -1;
-            changed();
-            status = "Loaded session.ally";
+        if (act == "device-page") {
+            devicePage_ = (devicePage_ + 1) % std::max(1, int((audioDevices.size() + 7) / 8));
+            return;
+        }
+        if (act == "patterns") {
+            patternMenu_ = !patternMenu_;
+            audioMenu_ = false;
+            return;
+        }
+        if (act == "audio-settings") {
+            audioMenu_ = !audioMenu_;
+            patternMenu_ = false;
+            return;
+        }
+        if (act.starts_with("device:")) {
+            audioConfig.deviceId = act.substr(7);
+            if (requestAudio) {
+                requestAudio(audioConfig);
+            }
+            audioMenu_ = false;
+            return;
+        }
+        if (act.starts_with("buffer:")) {
+            audioConfig.bufferFrames = uint32_t(std::stoul(act.substr(7)));
+            if (requestAudio) {
+                requestAudio(audioConfig);
+            }
+            return;
+        }
+        if (act == "rename-pattern") {
+            focus_ = Focus::PatternName;
+            editText_ = project_.tracks[size_t(selected_)].pattern().name;
+            patternMenu_ = false;
+            status = "Pattern name: type and Enter";
+            return;
+        }
+        if (act == "source-offset") {
+            focus_ = Focus::SourceOffset;
+            editText_.clear();
+            status = "Source start in seconds: type and Enter";
             return;
         }
         if (act == "undo" || act == "redo") {
@@ -890,7 +1166,39 @@ void Workspace::action(const std::string &act) {
             return;
         }
         before_ = project_;
-        if (act == "addtrack" && project_.tracks.size() < audio::Plan::maxTracks) {
+        if (act == "new-pattern" || act == "duplicate-pattern") {
+            project_.tracks[size_t(selected_)].createPattern(act == "duplicate-pattern");
+            selectedNote_ = -1;
+            if (selectedClip_ >= 0 && selectedClip_ < int(project_.tracks[size_t(selected_)].clips.size()) &&
+                project_.tracks[size_t(selected_)].clips[size_t(selectedClip_)].audio) {
+                selectedClip_ = -1;
+            }
+            patternMenu_ = false;
+            status = project_.tracks[size_t(selected_)].pattern().name;
+        } else if (act.starts_with("select-pattern:")) {
+            auto id = uint32_t(std::stoul(act.substr(15)));
+            auto &track = project_.tracks[size_t(selected_)];
+            if (track.findPattern(id)) {
+                track.activePattern = id;
+            }
+            selectedNote_ = -1;
+            patternMenu_ = false;
+        } else if (act == "assign-pattern") {
+            auto &track = project_.tracks[size_t(selected_)];
+            if (selectedClip_ >= 0 && selectedClip_ < int(track.clips.size()) &&
+                !track.clips[size_t(selectedClip_)].audio) {
+                auto &clip = track.clips[size_t(selectedClip_)];
+                clip.patternId = track.activePattern;
+                clip.name = track.pattern().name;
+            }
+            patternMenu_ = false;
+        } else if (act == "source-loop") {
+            auto &clips = project_.tracks[size_t(selected_)].clips;
+            if (selectedClip_ >= 0 && selectedClip_ < int(clips.size()) &&
+                clips[size_t(selectedClip_)].audio) {
+                clips[size_t(selectedClip_)].sourceLoop = !clips[size_t(selectedClip_)].sourceLoop;
+            }
+        } else if (act == "addtrack" && project_.tracks.size() < audio::Plan::maxTracks) {
             Track t;
             t.name = "Instrument " + std::to_string(project_.tracks.size() + 1);
             project_.tracks.push_back(t);
@@ -908,7 +1216,7 @@ void Workspace::action(const std::string &act) {
             project_.songMode = act == "song";
             engine_.rewind();
         } else if (act == "quantize") {
-            for (auto &n : project_.tracks[size_t(selected_)].notes) {
+            for (auto &n : project_.tracks[size_t(selected_)].pattern().notes) {
                 n.beat = std::clamp(std::round(n.beat / snap_) * snap_, 0.0, 4 - snap_);
                 n.length = std::min(n.length, 4 - n.beat);
             }
@@ -934,10 +1242,16 @@ void Workspace::action(const std::string &act) {
 }
 
 void Workspace::press(float x, float y, bool right) {
+    if (busy()) {
+        return;
+    }
     release();
     mouseX_ = x;
     mouseY_ = y;
     if (focus_ == Focus::Tempo && !tempo_.contains(x, y)) {
+        editKey("enter");
+    }
+    if ((focus_ == Focus::PatternName || focus_ == Focus::SourceOffset)) {
         editKey("enter");
     }
     if (focus_ == Focus::Search && !searchBox_.contains(x, y)) {
@@ -948,7 +1262,8 @@ void Workspace::press(float x, float y, bool right) {
         folded_ = false;
         return;
     }
-    for (const auto &b : buttons_) {
+    for (auto it = buttons_.rbegin(); it != buttons_.rend(); ++it) {
+        const auto &b = *it;
         if (b.rect.contains(x, y)) {
             if (!b.enabled) {
                 status = b.tooltip;
@@ -963,6 +1278,10 @@ void Workspace::press(float x, float y, bool right) {
             return;
         }
     }
+    if (patternMenu_ || audioMenu_) {
+        patternMenu_ = audioMenu_ = false;
+        return;
+    }
     if (lanes_.contains(x, y)) {
         int track = int((y - lanes_.y + trackScroll_) / 79);
         if (track < 0 || track >= int(project_.tracks.size())) {
@@ -973,6 +1292,10 @@ void Workspace::press(float x, float y, bool right) {
         for (auto it = clips_.rbegin(); it != clips_.rend(); ++it) {
             if (it->track == size_t(track) && it->rect.contains(x, y)) {
                 selectedClip_ = int(it->clip);
+                if (!clips[it->clip].audio) {
+                    project_.tracks[size_t(track)].activePattern = clips[it->clip].patternId;
+                    dirty_ = true;
+                }
                 before_ = project_;
                 if (right || erase_) {
                     clips.erase(clips.begin() + selectedClip_);
@@ -992,17 +1315,24 @@ void Workspace::press(float x, float y, bool right) {
         if (!right && !erase_) {
             before_ = project_;
             double beat = std::floor((x - lanes_.x) / lanes_.w * 32 / 4) * 4;
-            clips.push_back({"Pattern 01", beat, std::min(4.0, 32 - beat)});
+            Clip clip;
+            clip.name = project_.tracks[size_t(track)].pattern().name;
+            clip.patternId = project_.tracks[size_t(track)].activePattern;
+            clip.beat = beat;
+            clip.length = std::min(4.0, 32 - beat);
+            clips.push_back(clip);
             selectedClip_ = int(clips.size() - 1);
             commitEdit();
             changed();
         }
         return;
     }
-    if (detail_ != Detail::Piano) {
+    const auto &selectedClips = project_.tracks[size_t(selected_)].clips;
+    if (detail_ != Detail::Piano || (selectedClip_ >= 0 && selectedClip_ < int(selectedClips.size()) &&
+                                     selectedClips[size_t(selectedClip_)].audio)) {
         return;
     }
-    auto &notes = project_.tracks[size_t(selected_)].notes;
+    auto &notes = project_.tracks[size_t(selected_)].pattern().notes;
     float bw = grid_.w / 4 * float(zoom_), row = grid_.h / 13;
     if (velocity_.contains(x, y)) {
         int closest = -1;
@@ -1098,7 +1428,7 @@ void Workspace::move(float x, float y) {
         changed();
     }
     if (noteDrag_ >= 0) {
-        auto &note = project_.tracks[size_t(selected_)].notes[size_t(noteDrag_)];
+        auto &note = project_.tracks[size_t(selected_)].pattern().notes[size_t(noteDrag_)];
         double delta = std::round((x - dragX_) / (grid_.w / 4 * zoom_) / snap_) * snap_;
         if (noteResize_) {
             note.length = std::clamp(originalNote_.length + delta, .0625, 4 - note.beat);
@@ -1145,6 +1475,16 @@ void Workspace::textInput(const std::string &value) {
         if (search_.size() + value.size() <= 64) {
             search_ += value;
         }
+    } else if (focus_ == Focus::PatternName) {
+        if (editText_.size() + value.size() <= 80 && value.find_first_of("\r\n") == std::string::npos) {
+            editText_ += value;
+        }
+    } else if (focus_ == Focus::SourceOffset) {
+        for (char c : value) {
+            if ((std::isdigit(static_cast<unsigned char>(c)) || c == '.') && editText_.size() < 12) {
+                editText_ += c;
+            }
+        }
     } else if (focus_ == Focus::Tempo) {
         for (char c : value) {
             if ((std::isdigit(static_cast<unsigned char>(c)) || c == '.') && tempoText_.size() < 6) {
@@ -1160,7 +1500,7 @@ void Workspace::editKey(const std::string &key) {
         return;
     }
     if (key == "backspace") {
-        auto &s = focus_ == Focus::Search ? search_ : tempoText_;
+        auto &s = focus_ == Focus::Search ? search_ : focus_ == Focus::Tempo ? tempoText_ : editText_;
         if (!s.empty()) {
             size_t i = s.size() - 1;
             while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xc0) == 0x80) {
@@ -1171,6 +1511,39 @@ void Workspace::editKey(const std::string &key) {
         return;
     }
     if (key == "enter") {
+        if (focus_ == Focus::PatternName || focus_ == Focus::SourceOffset) {
+            before_ = project_;
+            try {
+                auto &track = project_.tracks[size_t(selected_)];
+                if (focus_ == Focus::PatternName) {
+                    if (editText_.empty()) {
+                        throw std::runtime_error("Pattern name cannot be empty");
+                    }
+                    track.pattern().name = editText_;
+                    for (auto &clip : track.clips) {
+                        if (!clip.audio && clip.patternId == track.activePattern) {
+                            clip.name = editText_;
+                        }
+                    }
+                } else {
+                    size_t used = 0;
+                    const double offset = std::stod(editText_, &used);
+                    if (used != editText_.size() || !std::isfinite(offset) || offset < 0 ||
+                        selectedClip_ < 0 || selectedClip_ >= int(track.clips.size())) {
+                        throw std::runtime_error("Invalid source start");
+                    }
+                    track.clips[size_t(selectedClip_)].sourceOffset = offset;
+                }
+                commitEdit();
+                changed();
+            } catch (const std::exception &error) {
+                if (before_) {
+                    project_ = *before_;
+                    before_.reset();
+                }
+                status = error.what();
+            }
+        }
         if (focus_ == Focus::Tempo && !tempoText_.empty()) {
             try {
                 size_t n = 0;
@@ -1211,38 +1584,58 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     action("track0");
     action("piano");
     redraw();
-    const auto count = project_.tracks[0].notes.size();
+    click("patterns");
+    click("duplicate-pattern");
+    const auto duplicated = project_.tracks[0].activePattern;
+    check(duplicated != 1 && project_.tracks[0].pattern().notes == baseline.tracks[0].pattern().notes,
+          "Duplicate pattern failed");
+    project_.tracks[0].pattern().notes[0].key = 61;
+    check(project_.tracks[0].findPattern(1)->notes[0].key == 60, "Patterns share edited notes");
+    project_.tracks[0].pattern().notes[0].key = 60;
+    click("patterns");
+    click("assign-pattern");
+    check(project_.tracks[0].clips[0].patternId == duplicated, "Pattern assignment failed");
+    click("undo");
+    click("undo");
+    click("patterns");
+    click("new-pattern");
+    check(project_.tracks[0].pattern().notes.empty(), "New pattern must be empty");
+    click("undo");
+    action("select-pattern:1");
+    redraw();
+    const auto count = project_.tracks[0].pattern().notes.size();
     float bw = grid_.w / 4, row = grid_.h / 13;
     float nx = grid_.x + bw * 1.26, ny = grid_.y + row * 1.5;
     press(nx, ny, false);
     release();
-    check(project_.tracks[0].notes.size() == count + 1, "Add note failed");
+    check(project_.tracks[0].pattern().notes.size() == count + 1, "Add note failed");
     redraw();
     press(nx, ny, false);
     move(nx + bw * .25, ny + row);
     release();
-    check(project_.tracks[0].notes.back().beat == 1.5 && project_.tracks[0].notes.back().key == 70,
+    check(project_.tracks[0].pattern().notes.back().beat == 1.5 &&
+              project_.tracks[0].pattern().notes.back().key == 70,
           "Move note failed");
     redraw();
-    auto n = project_.tracks[0].notes.back();
+    auto n = project_.tracks[0].pattern().notes.back();
     nx = grid_.x + float(n.beat + n.length) * bw - 2;
     ny = grid_.y + row * 2.5;
     press(nx, ny, false);
     move(nx + bw * .25, ny);
     release();
-    check(project_.tracks[0].notes.back().length == .5, "Resize note failed");
+    check(project_.tracks[0].pattern().notes.back().length == .5, "Resize note failed");
     redraw();
     press(grid_.x + bw * 1.5 + 3, velocity_.y + velocity_.h - 8, false);
     release();
-    check(project_.tracks[0].notes.back().velocity < .2f, "Velocity edit failed");
+    check(project_.tracks[0].pattern().notes.back().velocity < .2f, "Velocity edit failed");
     redraw();
     press(grid_.x + bw * 1.51, ny, true);
     release();
-    check(project_.tracks[0].notes.size() == count, "Delete note failed");
+    check(project_.tracks[0].pattern().notes.size() == count, "Delete note failed");
     click("undo");
-    check(project_.tracks[0].notes.size() == count + 1, "Undo failed");
+    check(project_.tracks[0].pattern().notes.size() == count + 1, "Undo failed");
     click("redo");
-    check(project_.tracks[0].notes.size() == count, "Redo failed");
+    check(project_.tracks[0].pattern().notes.size() == count, "Redo failed");
     click("tempo");
     textInput("137");
     editKey("enter");
@@ -1343,6 +1736,66 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     press(disabledRect.x + 10, disabledRect.y + 10, false);
     release();
     check(project_ == unmodified && undo_.size() == history, "Disabled/view control changed document");
+    const auto testRoot =
+        std::filesystem::temp_directory_path() /
+        ("ally-ui-workflow-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(testRoot);
+    const auto oldRequest = requestFile;
+    const auto oldDocument = document_;
+    try {
+        media::Pcm sample{44100, 1, std::vector<float>(4410, .2f)};
+        media::writeWav(testRoot / "import.wav", sample);
+        requestFile = [&](const std::string &act) {
+            fileSelected(act, testRoot / (act == "import"   ? "import.wav"
+                                          : act == "export" ? "render.wav"
+                                                            : "session.ally"));
+        };
+        auto waitFile = [&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            std::array<float, 512> scratch{};
+            while (busy() && std::chrono::steady_clock::now() < deadline) {
+                tick(0);
+                engine_.process(scratch);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            check(!busy(), "File worker did not finish");
+        };
+        click("addtrack");
+        click("import");
+        waitFile();
+        check(project_.tracks.back().clips.size() == 1 && project_.tracks.back().clips[0].audio,
+              "UI WAV import failed");
+        check(project_.sources.size() == baseline.sources.size() + 1, "UI source registration failed");
+        click("source-loop");
+        check(project_.tracks.back().clips[0].sourceLoop, "UI audio loop failed");
+        click("source-offset");
+        textInput("0.025");
+        editKey("enter");
+        check(project_.tracks.back().clips[0].sourceOffset == .025, "UI source trim failed");
+        click("save");
+        waitFile();
+        check(!modified() && Project::load(testRoot / "session.ally") == project_, "UI save failed");
+        click("export");
+        waitFile();
+        check(media::readWav(testRoot / "render.wav").frames() == project_.compile(48000).loopFrames,
+              "UI offline export failed");
+        click("load");
+        waitFile();
+        check(project_.tracks.back().clips.size() == 1, "UI open failed");
+        click("audio-settings");
+        check(audioMenu_, "Audio settings menu failed");
+        click("buffer:512");
+        check(audioConfig.bufferFrames == 512, "Audio buffer request failed");
+        click("audio-settings");
+        document_ = oldDocument;
+        requestFile = oldRequest;
+        std::filesystem::remove_all(testRoot);
+    } catch (...) {
+        document_ = oldDocument;
+        requestFile = oldRequest;
+        std::filesystem::remove_all(testRoot);
+        throw;
+    }
     project_ = baseline;
     before_.reset();
     undo_.clear();

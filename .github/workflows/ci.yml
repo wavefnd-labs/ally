@@ -1,0 +1,47 @@
+name: Desktop core
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: desktop-core-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    name: Native core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Linux ALSA development files
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Configure native backend and document core
+        run: cmake -S . -B build/ci -DALLY_BUILD_APP=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build/ci --config Debug --parallel 4
+      - name: Test
+        run: ctest --test-dir build/ci -C Debug --output-on-failure
+      - name: Independent audio
+        run: cmake -S libs/audio -B build/audio-ci -DBUILD_TESTING=ON
+      - run: cmake --build build/audio-ci --config Debug --parallel 4
+      - run: ctest --test-dir build/audio-ci -C Debug --output-on-failure
+      - name: Independent media
+        run: cmake -S libs/media -B build/media-ci -DBUILD_TESTING=ON
+      - run: cmake --build build/media-ci --config Debug --parallel 4
+      - run: ctest --test-dir build/media-ci -C Debug --output-on-failure
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Configure sanitizers without hardware dependency
+        run: cmake -S . -B build/sanitize -DALLY_BUILD_APP=OFF -DALLY_AUDIO_ALSA=OFF -DALLY_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build/sanitize --parallel 4
+      - run: ctest --test-dir build/sanitize --output-on-failure

@@ -30,6 +30,12 @@ def deps():
             "66c374ee7f786abcd8592d18fc5b18b1e3f1c67e923867eee5f9c503cb253afd",
         ),
         (
+            "chirlu/soxr",
+            "0.1.3",
+            "soxr-0.1.3",
+            "db6ca1b1e8405c6ef92f8294fc123d910abf0a114003b3f0f13fa57a95fd62d0",
+        ),
+        (
             "celtera/libremidi",
             "v4.5.0",
             "libremidi-4.5.0",

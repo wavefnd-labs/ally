@@ -17,6 +17,26 @@ Engine::Engine(uint32_t sampleRate, std::span<const float> stereoTexture) : samp
     texture_.assign(stereoTexture.begin(), stereoTexture.end());
 }
 
+std::span<const float> Engine::prepareSample(std::shared_ptr<const std::vector<float>> sample) {
+    if (!sample) {
+        return {};
+    }
+    for (const auto &existing : prepared_) {
+        if (existing == sample) {
+            return *existing;
+        }
+    }
+    if (sample->empty() || sample->size() % 2 || sample->size() > 16 * 1024 * 1024 ||
+        sample->size() * sizeof(float) > 256 * 1024 * 1024 - preparedBytes_ ||
+        !std::all_of(sample->begin(), sample->end(),
+                     [](float v) { return std::isfinite(v) && std::abs(v) <= 1; })) {
+        throw std::runtime_error("Prepared audio exceeds engine memory limits (restart to reclaim)");
+    }
+    prepared_.push_back(sample);
+    preparedBytes_ += sample->size() * sizeof(float);
+    return *sample;
+}
+
 bool Engine::submit(const Plan &plan) noexcept {
     if (!plan.loopFrames || plan.count > Plan::capacity || plan.sampleCount > Plan::sampleCapacity ||
         plan.clickCount > 32 || plan.loopEndFrame > plan.loopFrames || !std::isfinite(plan.masterGain) ||
@@ -35,9 +55,20 @@ bool Engine::submit(const Plan &plan) noexcept {
             return false;
         }
     }
+    for (const auto source : plan.sources) {
+        if (source.size() % 2) {
+            return false;
+        }
+        if (!source.empty() && !std::any_of(prepared_.begin(), prepared_.end(), [&](const auto &owned) {
+                return owned->data() == source.data() && owned->size() == source.size();
+            })) {
+            return false;
+        }
+    }
     for (uint32_t i = 0; i < plan.sampleCount; ++i) {
         const auto &s = plan.samples[i];
-        if (s.track >= Plan::maxTracks || s.start >= plan.loopFrames || !s.duration ||
+        if (s.offset > uint64_t(sampleRate_) * 1100 || s.source >= Plan::sampleCapacity ||
+            s.track >= Plan::maxTracks || s.start >= plan.loopFrames || !s.duration ||
             s.duration > plan.loopFrames - s.start) {
             return false;
         }
@@ -188,10 +219,16 @@ void Engine::process(std::span<float> out) noexcept {
         if (run) {
             for (uint32_t n = 0; n < plan_.sampleCount; ++n) {
                 const auto &event = plan_.samples[n];
-                if (!texture_.empty() && frame_ >= event.start && frame_ - event.start < event.duration) {
-                    size_t at = size_t((frame_ - event.start) % (texture_.size() / 2)) * 2;
-                    float l = texture_[at] * plan_.gains[event.track],
-                          r = texture_[at + 1] * plan_.gains[event.track];
+                const auto buffer =
+                    plan_.sourcesBound ? plan_.sources[event.source] : std::span<const float>(texture_);
+                if (!buffer.empty() && frame_ >= event.start && frame_ - event.start < event.duration) {
+                    const auto sourceFrame = event.offset + frame_ - event.start;
+                    if (!event.loop && sourceFrame >= buffer.size() / 2) {
+                        continue;
+                    }
+                    const size_t at = size_t(sourceFrame % (buffer.size() / 2)) * 2;
+                    float l = buffer[at] * plan_.gains[event.track],
+                          r = buffer[at + 1] * plan_.gains[event.track];
                     left += l;
                     right += r;
                     trackSample[event.track][0] += l;

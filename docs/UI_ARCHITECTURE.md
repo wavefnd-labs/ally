@@ -30,6 +30,14 @@ Inter가 설치된 Linux에서 화면을 검증했습니다. 다른 시스템에
 
 매 프레임 등록한 logical-coordinate hit target에 SDL 입력을 연결합니다. 지원하는 조작은 노트 추가/이동/길이 변경/삭제, velocity, quantize, 건반 미리 듣기, 클립 추가/이동/길이 변경/삭제, 채널 선택/추가, mute/solo, 채널·Master gain, 신스 cutoff, BPM 텍스트 입력, 브라우저 검색/접기, 도크 전환/접기/분할, 확대/스크롤, 룰러 seek, loop/metronome, 저장/불러오기/WAV export입니다.
 
-UI → Project::compile → Engine::submit 공개 인터페이스를 사용합니다. 계획 큐가 차면 최신 문서를 다음 프레임에 재시도합니다. 용량을 초과한 편집은 commit 시 원본으로 복구합니다. Undo/Redo는 최대 64개 문서 snapshot이며 drag 하나를 한 변경으로 기록합니다. 선택·검색·뷰 변경은 이력을 만들지 않습니다. UI는 엔진 내부 voice/backend에 접근하지 않습니다.
+UI → Project::prepare/compile → Engine::submit 공개 인터페이스를 사용합니다. 계획 큐가 차면 최신 문서를 다음 프레임에 재시도합니다. 용량을 초과한 편집은 commit 시 원본으로 복구합니다. Undo/Redo는 최대 64개 문서 snapshot이며 drag 하나를 한 변경으로 기록합니다. 트랙 선택·검색·뷰 변경은 이력을 만들지 않습니다. 패턴 선택은 Pattern mode 재생 및 저장 상태를 바꾸므로 이력에 포함됩니다. UI는 엔진 내부 voice/backend에 접근하지 않습니다.
 
 `--smoke`는 실제 hit target에서 편집 후 문서 상태를 검사합니다. `--view piano|devices|mixer`, `--window-size`, `--frames`, `--screenshot`으로 화면을 검증합니다. 전체 redraw 구조이며 대규모 문서용 culling/cache, 범용 docking tree, workspace 저장, 다중 선택·복사와 사용자 keybinding은 미구현입니다.
+
+## 작곡·파일·오디오 설정 연결
+
+기존 도크 제목을 패턴 selector로 사용하며 같은 palette·작은 control의 menu에서 New/Duplicate/Rename/Assign을 제공합니다. 8개씩 페이지를 전환하여 32패턴을 선택할 수 있습니다. MIDI 클립 선택은 그 패턴을 Piano Roll에 표시합니다. 오디오 클립 선택 시 같은 도크에 source waveform·Start(seconds)·Loop·Relink를 표시합니다. Samples와 Ctrl+I, WAV drop은 선택 트랙의 마지막 클립 뒤에 파일을 배치합니다. 프로젝트 및 export에는 SDL3 OS 파일 선택기를 사용합니다. 대화상자 callback은 문서에 접근하지 않고 mailbox에 선택 경로만 전달합니다.
+
+파일 worker가 진행 중이면 편집 입력을 잠시 막고 상태를 표시합니다. 성공한 snapshot만 채택하며 오류는 기존 문서를 보존합니다. Ctrl+Shift+S, 변경 표시, close Save/Discard/Cancel과 30초 자동 저장 및 시작 시 복구 선택을 제공합니다. 종료 선택을 취소하거나 저장 실패 시 창은 계속 열립니다.
+
+상태 바의 오디오 상태 또는 Ctrl+,에서 장치 UID/ID와 128/256/512/1024 frame buffer를 요청합니다. 실제 buffer, output 지연 추정치, native 오류, xrun 지표·처리 frames·최대 process 시간을 표시합니다. UI는 Backend 공개 인터페이스를 통한 애플리케이션 요청만 전달합니다. `.github/workflows/ci.yml`은 native backend와 문서 코어를 세 OS에서 검사하지만 GPU 창과 실제 소리를 검증하는 GUI CI는 아직 포함하지 않습니다.

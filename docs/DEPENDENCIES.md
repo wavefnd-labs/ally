@@ -19,3 +19,11 @@ Skia is intentionally fixed to the version whose headers and link were compiled 
 - [libremidi v4.5.0](https://github.com/celtera/libremidi/tree/v4.5.0)
 
 SDL uses zlib license, Skia BSD license and libremidi BSD-2-Clause; the exact upstream LICENSE/COPYING files remain in downloaded sources. System dependencies and Skia bundled skcms notices also require preservation during distribution. The project's own license is undecided. Local CPack output is a development artifact for this host, not a fully portable or publicly licensed product installer.
+
+## WAV 가져오기와 네이티브 출력 추가
+
+libsoxr는 [공식 0.1.3 소스](https://github.com/chirlu/soxr/tree/0.1.3)를 사용하며 archive SHA-256은 `db6ca1b1e8405c6ef92f8294fc123d910abf0a114003b3f0f13fa57a95fd62d0`입니다. CMake FetchContent 또는 x.py deps로 같은 버전을 준비합니다. 외부 타입을 숨긴 Ally::Resampler에서 stereo float32 고품질 변환을 수행합니다. scalar CR32/CR64 구성, OpenMP/LSR/AVFFT 비활성화이며 FFmpeg 의존성을 추가하지 않습니다. LGPL-2.1-or-later 원문은 패키지의 share/ally/licenses/libsoxr.txt에 포함합니다. 정적 연결 배포 시 재링크 및 소스 제공 의무를 충족하는 배포 정책은 프로젝트 라이선스 결정과 함께 다룹니다.
+
+libsoxr 0.1.3의 CMake module 경로·이전 link-interface 속성을 통합 계층에서 보정합니다. upstream 파일은 수정하지 않습니다. Clang sanitizer의 함수 포인터 타입 검사는 upstream generic C dispatch에서 오류를 보고하므로 libsoxr 타깃에만 `-fno-sanitize=function`을 적용합니다. ASan 및 나머지 UBSan과 Ally 코드는 그대로 검사하며 이 제외 범위를 검증 문서에 기록합니다.
+
+[SDL3 파일 대화상자](https://wiki.libsdl.org/SDL3/SDL_ShowOpenFileDialog), [WASAPI Initialize](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize), [Core Audio HAL output](https://developer.apple.com/documentation/audiotoolbox/kaudiounitsubtype_haloutput)을 참조했습니다. native SDK 이외의 오디오 I/O 라이브러리를 사용하지 않습니다.

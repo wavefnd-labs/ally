@@ -2,7 +2,14 @@
 namespace ally::audio {
 class UnsupportedBackend final : public Backend {
   public:
-    bool start(Engine &, std::string &error) override {
+    std::vector<Device> devices(std::string &error) override {
+        error = "Native audio disabled or unsupported";
+        return {};
+    }
+    BackendStats stats() const noexcept override {
+        return {};
+    }
+    bool start(Engine &, const BackendConfig &, std::string &error) override {
         error = "Native audio I/O is not implemented for this platform; offline render is available";
         return false;
     }

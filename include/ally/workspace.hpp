@@ -1,5 +1,9 @@
 #pragma once
+#include <ally/audio/backend.hpp>
+#include <ally/document.hpp>
 #include <ally/project.hpp>
+#include <functional>
+#include <future>
 #include <optional>
 #include <span>
 #include <string>
@@ -27,6 +31,25 @@ class Workspace {
     }
     bool sync();
     void verifyInteractions(SkCanvas &, float, float);
+    void fileSelected(const std::string &action, const std::filesystem::path &path);
+    void tick(double seconds);
+    bool busy() const {
+        return job_.valid() || dialogPending_;
+    }
+    bool modified() const {
+        return document_.dirty(project_);
+    }
+    void setDocument(const std::filesystem::path &path, const std::filesystem::path &recovery,
+                     bool recovered = false);
+    void discardRecovery() {
+        document_.discardRecovery();
+    }
+    std::string title() const;
+    std::function<void(const std::string &)> requestFile;
+    std::function<void(const audio::BackendConfig &)> requestAudio;
+    std::vector<audio::Device> audioDevices;
+    audio::BackendConfig audioConfig;
+    audio::BackendStats audioStats;
     std::string status = "Ready", backendStatus = "Offline", midiStatus;
     int selectedTrack() const {
         return selected_;
@@ -37,7 +60,7 @@ class Workspace {
 
   private:
     enum class Detail { Piano, Devices, Mixer };
-    enum class Focus { None, Search, Tempo };
+    enum class Focus { None, Search, Tempo, PatternName, SourceOffset };
     struct Button {
         Rect rect;
         std::string action, tooltip;
@@ -57,7 +80,15 @@ class Workspace {
     void changed();
     void remember(const Project &);
     void commitEdit();
+    void menu(SkCanvas &);
+    void audioClip(SkCanvas &, Rect);
+    struct FileResult {
+        std::string action;
+        std::filesystem::path path;
+        Project project;
+    };
     Project &project_;
+    DocumentSession document_;
     audio::Engine &engine_;
     std::span<const float> texture_;
     std::vector<Button> buttons_;
@@ -69,6 +100,11 @@ class Workspace {
     Detail detail_ = Detail::Piano;
     Focus focus_ = Focus::None;
     std::string search_, tempoText_;
+    std::string editText_;
+    std::future<FileResult> job_;
+    bool dialogPending_ = false, patternMenu_ = false, audioMenu_ = false;
+    int patternPage_ = 0, devicePage_ = 0;
+    uint32_t relinkId_ = 0;
     bool browser_ = true, folded_ = false, erase_ = false, dirty_ = true;
     bool dividerDrag_ = false, noteResize_ = false, clipResize_ = false;
     int selected_ = 0, selectedClip_ = 0, selectedNote_ = -1;

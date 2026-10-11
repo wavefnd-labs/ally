@@ -83,13 +83,13 @@ int main() {
     // Capacity validation accounts for arrangement expansion even in pattern mode.
     auto large = ally::Project::demo();
     large.songMode = false;
-    large.tracks[0].notes.assign(65, {60, 0, .5, .7f});
+    large.tracks[0].pattern().notes.assign(130, {60, 0, .5, .7f});
     CHECK(!large.valid());
     auto invalid = ally::Project::demo();
     invalid.tracks[0].clips[0].beat = 31;
     CHECK(!invalid.valid());
     invalid = ally::Project::demo();
-    invalid.tracks[3].clips[0].name = "missing.wav";
+    invalid.tracks[3].clips[0].sourceId = 999;
     CHECK(!invalid.valid());
     invalid = ally::Project::demo();
     invalid.tracks.resize(9);

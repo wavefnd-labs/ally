@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -15,6 +16,9 @@ struct NoteEvent {
 struct SampleEvent {
     uint64_t start = 0, duration = 1;
     uint8_t track = 0;
+    uint32_t source = 0;
+    uint64_t offset = 0;
+    bool loop = true;
 };
 struct Plan {
     static constexpr size_t capacity = 512, maxTracks = 8, sampleCapacity = 32;
@@ -26,6 +30,8 @@ struct Plan {
     std::array<float, maxTracks> gains{}, cutoffs{};
     std::array<uint32_t, maxTracks> attacks{}, releases{};
     std::array<SampleEvent, sampleCapacity> samples{};
+    std::array<std::span<const float>, sampleCapacity> sources{};
+    bool sourcesBound = false;
     std::array<uint64_t, 32> clicks{};
     Plan() {
         gains.fill(.6f);
@@ -75,6 +81,8 @@ class Engine {
     bool submit(const Plan &plan) noexcept;      // UI producer. Rejects invalid plans/full queue.
     bool midi(MidiEvent event) noexcept;         // MIDI producer, separate from UI.
     bool audition(AuditionEvent event) noexcept; // UI producer, isolated from MIDI input.
+    // Non-RT owner prepares immutable PCM. Retained until engine destruction, bounded to 256 MiB.
+    std::span<const float> prepareSample(std::shared_ptr<const std::vector<float>> sample);
     void looping(bool value) noexcept {
         looping_.store(value);
     }
@@ -133,6 +141,8 @@ class Engine {
     std::array<Voice, 64> voices_{};
     uint64_t frame_ = 0;
     std::vector<float> texture_;
+    std::vector<std::shared_ptr<const std::vector<float>>> prepared_;
+    size_t preparedBytes_ = 0;
     uint32_t clickRemaining_ = 0;
     std::atomic<bool> playing_{false}, reset_{false}, looping_{true}, metronome_{false};
     std::atomic<uint64_t> seek_{std::numeric_limits<uint64_t>::max()};

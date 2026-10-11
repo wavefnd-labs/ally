@@ -107,6 +107,28 @@ int main() {
         }
         CHECK(std::abs(poly.trackPeak(0, 0) - measured) < 1e-6f);
     }
+    {
+        Engine sampleEngine;
+        auto sample = std::make_shared<const std::vector<float>>(std::vector<float>{.1f, .2f, .3f, .4f});
+        Plan samplePlan;
+        samplePlan.loopFrames = 16;
+        samplePlan.sourcesBound = true;
+        samplePlan.sources[0] = sampleEngine.prepareSample(sample);
+        samplePlan.sampleCount = 1;
+        samplePlan.samples[0] = {0, 8, 0, 0, 1, false};
+        samplePlan.gains[0] = 1;
+        CHECK(sampleEngine.submit(samplePlan));
+        sample.reset(); // Registered buffers survive document/source release.
+        sampleEngine.play(true);
+        std::array<float, 16> output{};
+        forbidNew = true;
+        sampleEngine.process(output);
+        forbidNew = false;
+        CHECK(output[0] == .3f && output[1] == .4f && output[2] == 0);
+        std::array<float, 2> borrowed{.1f, .2f};
+        samplePlan.sources[0] = borrowed;
+        CHECK(!sampleEngine.submit(samplePlan)); // No unowned spans may reach the RT consumer.
+    }
     p.notes[0].key = 200;
     CHECK(!engine.submit(p));
     p.notes[0].key = 69;
