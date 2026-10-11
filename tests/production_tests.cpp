@@ -42,12 +42,8 @@ void operator delete[](void *p, std::size_t) noexcept {
             throw std::runtime_error(#x);                                                                    \
         }                                                                                                    \
     } while (false)
-int main() {
+void checkProduction(const std::filesystem::path &root) {
     using namespace ally;
-    const auto root =
-        std::filesystem::temp_directory_path() /
-        ("ally-production-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::filesystem::create_directory(root);
     auto p = Project::empty();
     CHECK(p.valid() && p.tracks[0].pattern().notes.empty());
     p.tracks[0].pattern().notes = {{60, 0, .5, .7f}, {64, 1, .5, .8f}};
@@ -219,7 +215,22 @@ int main() {
         failed = true;
     }
     CHECK(failed);
-    std::filesystem::remove_all(root);
     std::cout << "Group editing, extended arrangement, instruments/mix roundtrip, MIDI takes, disk "
                  "streaming/offline render, multitrack capture passed\n";
+}
+
+int main() {
+    try {
+        const auto root = std::filesystem::temp_directory_path() /
+                          ("ally-production-" +
+                           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory(root);
+        // Windows cannot remove files while stream readers still hold their handles.
+        checkProduction(root);
+        std::filesystem::remove_all(root);
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << "Production test failed: " << error.what() << '\n';
+        return 1;
+    }
 }
