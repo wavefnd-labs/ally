@@ -88,7 +88,7 @@ ctest --test-dir build/media --output-on-failure
 - Mixer: 채널·Master fader와 mute, 채널 solo, 실제 peak. 휠로 strip을 가로 스크롤합니다. Devices: 악기 제목으로 종류를 전환하고 각 노브를 수직으로 드래그합니다. 샘플러 Root / Attack / Release, EQ Low / Mid / High, compressor threshold / delay Wet / Time이 실제 처리에 연결됩니다.
 - BPM 클릭 후 숫자 입력·Enter로 적용, Escape 취소. 브라우저 Search에 입력해 목록을 필터링합니다. Snap 1/16·1/8, +/- 확대, loop/metronome 버튼을 지원합니다.
 - Shift+클릭: 노트/클립 선택 추가·해제, Shift+빈 곳 드래그: 선택 사각형. 선택 항목은 함께 이동·resize·삭제됩니다.
-- Ctrl+A/C/X/V/D: 전체 선택/복사/잘라내기/붙여넣기/복제. 붙여넣기는 마지막 editor 클릭의 snap 위치를 사용합니다. 다른 트랙으로 MIDI 클립을 붙이면 패턴도 독립 복제됩니다. Delete: 선택 삭제. 방향키: 시간/음높이 이동, Alt+좌우: 길이 변경.
+- Ctrl+A/C/X/V/D: 전체 선택/복사/잘라내기/붙여넣기/복제. 붙여넣기는 마지막 editor 클릭의 snap 위치를 사용합니다. 다른 트랙/문서로 MIDI 클립을 붙이면 패턴도 독립 복제되고 오디오 클립은 소스도 유지합니다. Delete: 선택 삭제. 방향키: 시간/음높이 이동, Alt+좌우: 길이 변경.
 - Arrangement `+8 bars`: timeline 확장. 상단 +/-: Arrangement 확대·축소, Shift+휠: 해당 editor 가로 이동. Ctrl+N: 빈 프로젝트(미저장 변경 확인).
 - 트랙의 Record 표시: Arm. R: armed 오디오 녹음 시작/종료. Shift+R: 선택 트랙 MIDI take 시작/종료. Stop: take 확정. 녹음 위치는 파일 선택 시 transport 위치입니다.
 - Mixer Pan은 수직 드래그, Master/Bus 출력과 Send는 클릭해 변경합니다. 버스 strip은 가로 스크롤로 접근합니다.

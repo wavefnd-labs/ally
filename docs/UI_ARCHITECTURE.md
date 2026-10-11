@@ -44,7 +44,7 @@ UI → Project::prepare/compile → Engine::submit 공개 인터페이스를 사
 
 ## 작곡과 녹음 확장
 
-Editing model은 note/clip selection과 clipboard를 소유하고 group transform의 이동 한계를 전체 선택에서 계산합니다. Shift toggle/marquee, Ctrl+A/C/X/V/D, Delete와 화살표 입력이 실제 문서 transaction에 연결됩니다. move 전체를 drag 이전 snapshot에서 계산해 cumulative drift를 피하며 commit 하나가 Undo 하나입니다. 복사된 MIDI clip을 다른 트랙에 붙일 때 원본 트랙+pattern ID로 패턴 복제를 구분합니다.
+Editing model은 note/clip selection과 clipboard를 소유하고 group transform의 이동 한계를 전체 선택에서 계산합니다. Shift toggle/marquee, Ctrl+A/C/X/V/D, Delete와 화살표 입력이 실제 문서 transaction에 연결됩니다. move 전체를 drag 이전 snapshot에서 계산해 cumulative drift를 피하며 commit 하나가 Undo 하나입니다. 복사된 MIDI clip을 다른 트랙에 붙일 때 원본 트랙+pattern ID로 패턴 복제를 구분합니다. Clipboard 종류는 editor selection과 따로 보존하며 다른 문서에서도 패턴/오디오 소스를 유지합니다. 잘못된 selection index는 문서를 바꾸기 전에 거절합니다.
 
 기본 8마디 viewport는 유지하고 Arrangement +8 bars, zoom 및 horizontal scroll로 최대 256마디를 편집합니다. offscreen clip과 파형 pixel은 cull합니다. 32트랙 색상은 기존 8색 palette를 반복합니다.
 

@@ -1445,6 +1445,8 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if (act.starts_with("pan")) {
+            editing_.clear();
+            selectedNote_ = selectedClip_ = -1;
             selected_ = std::stoi(act.substr(3));
             knobDrag_ = 10;
             before_ = project_;
@@ -1454,6 +1456,8 @@ void Workspace::action(const std::string &act) {
         }
         if (act.starts_with("route") || act.starts_with("send")) {
             if (act.size() > (act.starts_with("route") ? 5u : 4u)) {
+                editing_.clear();
+                selectedNote_ = selectedClip_ = -1;
                 selected_ = std::stoi(act.substr(act.starts_with("route") ? 5 : 4));
             }
         }

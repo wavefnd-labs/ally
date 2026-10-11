@@ -15,9 +15,9 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 | 검사 | 결과 |
 |---|---|
 | Debug / Release 전체 빌드 | 성공, 자체 소스 warning/error 없음 |
-| Debug CTest | 8/8 통과, 11.29초 |
-| Release CTest | 8/8 통과, 0.96초 |
-| ASan / UBSan / LeakSanitizer | 8/8 통과, 36.35초, 샌드박스 밖 실행 |
+| Debug CTest | 8/8 통과, 11.18초 |
+| Release CTest | 8/8 통과, 0.88초 |
+| ASan / UBSan / LeakSanitizer | 8/8 통과, 36.06초, 샌드박스 밖 실행 |
 | 독립 Audio GCC Release / CTest | 성공, 4/4 통과 |
 | 독립 Media GCC Release / CTest | 성공, 1/1 통과 |
 | Release GUI smoke 1440×900 / 870×650 | 실제 NVIDIA GL, 두 크기 모두 통과 |
@@ -26,12 +26,14 @@ Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL
 | Mixer 실제 재생 | peak 0.265195, 173,056프레임 처리, xrun 0, 최대 process 0.313373 ms |
 | OS 기본 창 | X11 title bar 37px, close-request smoke 통과 |
 | clang-format / git diff whitespace | 통과 |
+| 설치 SDK 소비자 | 외부 CMake에서 Audio/Resampler/Media·PipeWire dependency 해결 및 PCM 변환 검사 통과 |
+| CPack Linux ZIP | 생성·압축 해제 후 실행 권한, 디자인/캡처 일치·GUI smoke·743,226프레임 WAV export/inspect 통과 |
 
 위 최대 처리 시간은 해당 짧은 실행에서 관측한 값이며 최악 부하 보증이 아닙니다. output latency 21.3333 ms는 backend 추정값으로, physical loopback으로 측정한 round-trip latency가 아닙니다. 입력 장치는 `pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo`이며 실제 PipeWire Audio/Source discovery와 ALSA PipeWire PCM으로 열었습니다. 연결된 외부 마이크의 음질이나 audible loopback은 검증하지 않았습니다.
 
 ## 검사한 동작
 
-- Editing: 노트/클립 다중 선택, 그룹 clamp/이동/resize, clipboard·duplicate·삭제, cross-track 패턴 복제, 한 번의 Undo, timeline 확장·줌/스크롤, 16트랙 문서 검사.
+- Editing: 노트/클립 다중 선택, 그룹 clamp/이동/resize, clipboard·duplicate·삭제, cross-track 패턴 복제, editor 전환 뒤 clipboard와 새 문서로 패턴/오디오 소스 붙여넣기, stale selection 거절, 한 번의 Undo, timeline 확장·줌/스크롤, 16트랙 문서 검사.
 - Instruments/MIDI: instrument/drum map·FX v6 저장/복원, sampler octave 재생, drum one-shot, 블록 안 128번째 샘플 MIDI 시작, clock 증가, 4-beat 경계 MIDI take 분할.
 - Audio/Media: 약 45.8초 WAV를 작은 block으로 생성·읽기, stream cache 경계 4095/4096, 전체 PCM 없이 소스 준비/문서 복원·trim export, 손상 파일 거절. capture→fixed SPSC→동시 left/right/stereo 3개 WAV 내용·길이 검사.
 - DSP: pan/bus gain/send의 정확한 샘플 값, low EQ·compressor 감쇠, 80샘플 delay 위치, seek/rewind tail 초기화, cyclic bus route 거절.

@@ -64,6 +64,21 @@ int main() {
     CHECK(p.tracks[0].pattern().notes.size() == 4);
     edit.erase(p, 0);
     CHECK(p.tracks[0].pattern().notes.size() == 2);
+    edit.selectNote(0, false);
+    edit.copy(p, 0);
+    edit.notes = false; // Switching editor must not reinterpret the clipboard.
+    auto noteDestination = Project::empty();
+    edit.paste(noteDestination, 0, 0);
+    CHECK(edit.notes && noteDestination.tracks[0].pattern().notes.size() == 1);
+    edit.selectedNotes = {0, 9999};
+    auto unchanged = noteDestination;
+    bool stale = false;
+    try {
+        edit.erase(noteDestination, 0);
+    } catch (const std::exception &) {
+        stale = true;
+    }
+    CHECK(stale && noteDestination == unchanged);
     p = Project::empty();
     p.tracks[0].clips = {{"A", 0, 4}, {"B", 8, 4}};
     edit.selectClip({0, 0}, false);
@@ -83,6 +98,13 @@ int main() {
     edit.copy(p, 0);
     edit.paste(p, 1, 40);
     CHECK(p.tracks[1].clips[0].beat == 40 && p.tracks[1].findPattern(p.tracks[1].clips[0].patternId));
+    p.tracks[0].pattern().notes = {{71, 0, 1, .8f}};
+    edit.selectClip({0, 0}, false);
+    edit.copy(p, 0);
+    auto clipDestination = Project::empty();
+    edit.paste(clipDestination, 0, 0);
+    CHECK(clipDestination.tracks[0].findPattern(clipDestination.tracks[0].clips[0].patternId)->notes[0].key ==
+          71);
     p.tracks[1].strip.route = 0;
     p.tracks[1].strip.sends[1] = .2f;
     p.tracks[1].strip.pan = -.5f;
@@ -137,6 +159,12 @@ int main() {
     p.bpm = 120;
     p.importWav(longPath, 0);
     CHECK(p.sources.back().stream && !p.sources.back().pcm && p.timelineBeats == 92);
+    edit.selectClip({0, 0}, false);
+    edit.copy(p, 0);
+    auto audioDestination = Project::empty();
+    edit.paste(audioDestination, 0, 0);
+    CHECK(audioDestination.valid() && audioDestination.sources.size() == 2 &&
+          audioDestination.source(audioDestination.tracks[0].clips[0].sourceId)->stream);
     p.tracks[0].clips[0].sourceOffset = 20;
     p.tracks[0].clips[0].length = 1;
     p.save(root / "stream.ally");

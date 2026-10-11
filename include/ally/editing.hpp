@@ -1,5 +1,6 @@
 #pragma once
 #include <ally/project.hpp>
+#include <optional>
 namespace ally {
 struct ClipRef {
     size_t track = 0, clip = 0;
@@ -26,8 +27,10 @@ class Editing {
         Clip clip;
         size_t track = 0;
         Pattern pattern;
+        std::optional<AudioSource> source;
     };
     std::vector<Note> noteClipboard_;
     std::vector<CopiedClip> clipClipboard_;
+    bool clipboardNotes_ = true;
 };
 } // namespace ally

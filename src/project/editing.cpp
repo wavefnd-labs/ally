@@ -40,6 +40,7 @@ void Editing::selectClip(ClipRef ref, bool additive) {
     }
 }
 void Editing::copy(const Project &p, size_t track) {
+    clipboardNotes_ = notes;
     noteClipboard_.clear();
     clipClipboard_.clear();
     if (notes) {
@@ -52,7 +53,8 @@ void Editing::copy(const Project &p, size_t track) {
             const auto &t = p.tracks.at(ref.track);
             const auto &clip = t.clips.at(ref.clip);
             clipClipboard_.push_back(
-                {clip, ref.track, clip.audio ? Pattern{} : *t.findPattern(clip.patternId)});
+                {clip, ref.track, clip.audio ? Pattern{} : *t.findPattern(clip.patternId),
+                 clip.audio ? std::optional<AudioSource>(*p.source(clip.sourceId)) : std::nullopt});
         }
     }
 }
@@ -63,7 +65,7 @@ void Editing::paste(Project &project, size_t track, double beat) {
     Project candidate = project;
     std::vector<size_t> newNotes;
     std::vector<ClipRef> newClips;
-    if (notes && !noteClipboard_.empty()) {
+    if (clipboardNotes_ && !noteClipboard_.empty()) {
         double first = std::min_element(noteClipboard_.begin(), noteClipboard_.end(), [](auto a, auto b) {
                            return a.beat < b.beat;
                        })->beat;
@@ -73,7 +75,7 @@ void Editing::paste(Project &project, size_t track, double beat) {
             newNotes.push_back(list.size());
             list.push_back(n);
         }
-    } else if (!notes && !clipClipboard_.empty()) {
+    } else if (!clipboardNotes_ && !clipClipboard_.empty()) {
         double first = Project::maxTimeline;
         size_t firstTrack = audio::Plan::maxTracks;
         for (auto c : clipClipboard_) {
@@ -88,7 +90,8 @@ void Editing::paste(Project &project, size_t track, double beat) {
             }
             auto &t = candidate.tracks[target];
             c.clip.beat += beat - first;
-            if (!c.clip.audio && target != c.track) {
+            const auto *existingPattern = t.findPattern(c.clip.patternId);
+            if (!c.clip.audio && (target != c.track || !existingPattern || *existingPattern != c.pattern)) {
                 const auto key = std::make_tuple(target, c.track, c.pattern.id);
                 if (!patterns.contains(key)) {
                     auto id = t.createPattern();
@@ -98,6 +101,24 @@ void Editing::paste(Project &project, size_t track, double beat) {
                     patterns[key] = id;
                 }
                 c.clip.patternId = patterns[key];
+            }
+            if (c.source) {
+                const AudioSource *matched = nullptr;
+                uint32_t next = 1;
+                for (const auto &source : candidate.sources) {
+                    next = std::max(next, source.id + 1);
+                    if (source.fingerprint == c.source->fingerprint &&
+                        source.originalRate == c.source->originalRate &&
+                        source.originalFrames == c.source->originalFrames && source.path == c.source->path) {
+                        matched = &source;
+                    }
+                }
+                if (matched) {
+                    c.clip.sourceId = matched->id;
+                } else {
+                    c.source->id = c.clip.sourceId = next;
+                    candidate.sources.push_back(*c.source);
+                }
             }
             newClips.push_back({target, t.clips.size()});
             t.clips.push_back(c.clip);
@@ -109,6 +130,7 @@ void Editing::paste(Project &project, size_t track, double beat) {
         throw std::runtime_error("Paste exceeds pattern, timeline or event limits");
     }
     project = std::move(candidate);
+    notes = clipboardNotes_;
     selectedNotes = std::move(newNotes);
     selectedClips = std::move(newClips);
 }
@@ -117,6 +139,12 @@ void Editing::erase(Project &project, size_t track) {
         auto &list = project.tracks.at(track).pattern().notes;
         auto indexes = selectedNotes;
         std::sort(indexes.rbegin(), indexes.rend());
+        indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
+        for (auto i : indexes) {
+            if (i >= list.size()) {
+                throw std::runtime_error("Stale note selection");
+            }
+        }
         for (auto i : indexes) {
             list.erase(list.begin() + std::ptrdiff_t(i));
         }
@@ -124,6 +152,12 @@ void Editing::erase(Project &project, size_t track) {
         auto refs = selectedClips;
         std::sort(refs.begin(), refs.end(),
                   [](auto a, auto b) { return a.track != b.track ? a.track > b.track : a.clip > b.clip; });
+        refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+        for (auto ref : refs) {
+            if (ref.track >= project.tracks.size() || ref.clip >= project.tracks[ref.track].clips.size()) {
+                throw std::runtime_error("Stale clip selection");
+            }
+        }
         for (auto ref : refs) {
             auto &list = project.tracks.at(ref.track).clips;
             list.erase(list.begin() + std::ptrdiff_t(ref.clip));
