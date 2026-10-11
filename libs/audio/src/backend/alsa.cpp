@@ -1,3 +1,4 @@
+#include "thread_priority.hpp"
 #include <algorithm>
 #include <ally/audio/backend.hpp>
 #include <ally/audio/engine.hpp>
@@ -49,6 +50,7 @@ class AlsaBackend final : public Backend {
         config_ = config;
         processed_ = underruns_ = maxProcess_ = 0;
         error_ = 0;
+        priority_ = 0;
         int rc = snd_pcm_open(&pcm_, config.deviceId.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
         if (rc < 0) {
             error = snd_strerror(rc);
@@ -71,6 +73,7 @@ class AlsaBackend final : public Backend {
         running_ = true;
         thread_ = std::jthread([this, &engine] {
             std::array<float, 4096> buffer{};
+            priority_ = requestAudioThreadPriority();
             while (running_.load()) {
                 const auto begin = std::chrono::steady_clock::now();
                 engine.process(std::span(buffer).first(config_.bufferFrames * 2));
@@ -102,9 +105,16 @@ class AlsaBackend final : public Backend {
         return true;
     }
     BackendStats stats() const noexcept override {
-        return {
-            rate_,         period_,        latency_, processed_.load(), underruns_.load(), maxProcess_.load(),
-            error_.load(), running_.load()};
+        return {rate_,
+                period_,
+                latency_,
+                processed_.load(),
+                underruns_.load(),
+                maxProcess_.load(),
+                error_.load(),
+                running_.load(),
+                0,
+                priority_.load()};
     }
     void stop() noexcept override {
         running_ = false;
@@ -128,6 +138,7 @@ class AlsaBackend final : public Backend {
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> processed_{0}, underruns_{0}, maxProcess_{0};
     std::atomic<int64_t> error_{0};
+    std::atomic<uint32_t> priority_{0};
     std::jthread thread_;
 };
 std::unique_ptr<Backend> makeNativeBackend() {

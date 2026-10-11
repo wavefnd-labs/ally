@@ -33,7 +33,7 @@ libsoxr upstream의 C dispatch에는 기존 Clang function-type instrumentation 
 - 새 native GUI 녹음 프로세스만 강제 종료한 뒤 CLI로 실제 partial을 복구했습니다. 49,152 complete frames를 읽고 원본 partial의 SHA-256 불변을 확인했습니다. 합성 fixture도 checkpoint 이후 PCM, incomplete final frame, 기존 목적지 거절을 검사합니다.
 - RF64 전체 쓰기: sparse shortcut 없이 536,936,447 stereo frames / 4,295,491,656 bytes를 기록했습니다. RIFF→RF64 전환과 ds64 크기, 끝 sample .125 읽기가 통과했습니다. 이 경계 fixture는 `/tmp`의 tmpfs에 기록했으며 실제 녹음 soak는 HDD였습니다.
 
-실제 입력 데이터와 모듈 경로를 검증했지만 외부 마이크 음질과 physical loopback은 측정하지 않았습니다. 전체 6시간 take/32트랙 hardware soak·정전·디스크 공간 소진 검사는 수행하지 않았습니다.
+실제 입력 데이터와 모듈 경로를 검증했지만 외부 마이크 음질과 physical loopback은 측정하지 않았습니다. 전체 6시간 take와 32트랙 30분 부하 검사는 실제 실행을 시작했으나 컴퓨터를 밤새 켜두지 않는 사용자 조건에 따라 중단했습니다. 완료된 검증이 아닙니다. [별도 장시간 검증 기록](LONG_RECORDING_VALIDATION.md)에서 실패 재현·수정·사용자 조건에 따른 중단·짧은 검사·가속 데이터 검사를 구분합니다. 32채널 hardware input·정전·디스크 공간 소진 검사는 수행하지 않았습니다.
 
 ## HQ 변환과 지연 검사
 

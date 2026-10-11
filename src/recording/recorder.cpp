@@ -31,7 +31,9 @@ struct Recorder::Impl {
         std::array<float, 2048> samples{};
     };
     audio::Engine &engine;
-    std::unique_ptr<audio::SpscQueue<Block, 1024>> queue = std::make_unique<audio::SpscQueue<Block, 1024>>();
+    // About 64 MiB, prepared outside capture: 43.7 s of 48 kHz input backlog.
+    // 32 independent files can stall the disk worker during filesystem writeback.
+    std::unique_ptr<audio::SpscQueue<Block, 8192>> queue = std::make_unique<audio::SpscQueue<Block, 8192>>();
     std::thread thread;
     std::atomic<bool> accepting{false}, stopping{false}, failed{false}, unknownGap{false};
     std::atomic<uint64_t> captured{0}, lost{0}, written{0}, highWater{0}, firstClock{UINT64_MAX};

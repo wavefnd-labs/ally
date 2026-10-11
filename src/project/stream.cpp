@@ -11,7 +11,8 @@
 namespace ally {
 namespace {
 class DiskStream final : public audio::SampleStream {
-    static constexpr size_t block = 4096, slots = 64;
+    static constexpr size_t block = 4096, slots = 512;
+    static constexpr size_t aheadBlocks = 256;
     static constexpr uint64_t absent = UINT64_MAX;
     struct Slot {
         // 0 empty, 1 worker writing, 2 ready, 3 RT/non-RT reader pinned.
@@ -26,8 +27,14 @@ class DiskStream final : public audio::SampleStream {
     std::atomic<uint64_t> misses_{0};
     std::thread worker_;
     uint64_t frames_;
+    static constexpr size_t index(uint64_t chunk) noexcept {
+        // Keep the loop head warm. Without dedicated head
+        // slots, tails whose chunk count is not a multiple of the cache size can evict them.
+        return chunk < aheadBlocks ? size_t(chunk)
+                                   : aheadBlocks + size_t((chunk - aheadBlocks) % (slots - aheadBlocks));
+    }
     bool available(uint64_t chunk) {
-        auto &slot = (*cache_)[size_t(chunk % slots)];
+        auto &slot = (*cache_)[index(chunk)];
         int ready = 2;
         if (!slot.state.compare_exchange_strong(ready, 3, std::memory_order_acquire)) {
             return false;
@@ -169,12 +176,27 @@ class DiskStream final : public audio::SampleStream {
             return;
         }
         const auto chunk = frame / block;
-        for (uint64_t i = chunk; i < chunk + 8 && i * block < frames_; ++i) {
-            (*cache_)[size_t(i % slots)].requested.store(i);
+        const uint64_t chunks = (frames_ + block - 1) / block;
+        const auto ahead = std::min<uint64_t>(aheadBlocks, chunks);
+        // A looping clip needs its beginning before the last block is consumed.
+        // The wrapped prefix occupies different slots from the current tail.
+        for (uint64_t offset = 0; offset < ahead; ++offset) {
+            const auto requested = (chunk + offset) % chunks;
+            (*cache_)[index(requested)].requested.store(requested);
         }
         if (wait) {
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!available(chunk)) {
+            // The complete non-RT window may include many expensive rational-phase seeks.
+            // Sanitized builds and a busy disk need a larger bounded preparation timeout.
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            auto prepared = [&] {
+                for (uint64_t offset = 0; offset < ahead; ++offset) {
+                    if (!available((chunk + offset) % chunks)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            while (!prepared()) {
                 if (failed_.load() || std::chrono::steady_clock::now() > deadline) {
                     throw std::runtime_error("Disk stream prefetch failed");
                 }
@@ -191,7 +213,7 @@ class DiskStream final : public audio::SampleStream {
         if (!(frame % block)) {
             prefetch(frame, false);
         }
-        auto &slot = (*cache_)[size_t(chunk % slots)];
+        auto &slot = (*cache_)[index(chunk)];
         int ready = 2;
         if (slot.state.compare_exchange_strong(ready, 3, std::memory_order_acquire)) {
             if (slot.tag.load() == chunk) {

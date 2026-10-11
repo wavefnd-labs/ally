@@ -22,11 +22,11 @@
 
 `StreamingResampler`는 worker용 상태형 stereo API입니다. process는 실제 consumed/produced frame 수를 반환합니다. 입력을 모두 소비한 뒤 별도 EOF drain을 반복하여 FIR tail을 얻으며 reset으로 독립 신호를 시작합니다. `bufferedFrames`는 내부 대기 길이이며 결과 WAV에 추가해야 하는 시작 offset이 아닙니다. 외부 soxr 타입은 공개 헤더에 없습니다.
 
-DiskStream은 Media WavReader와 이를 조합합니다. 4096 frames × 64 slots = 2 MiB cache, atomic pin으로 RT reader와 disk worker를 분리합니다. 다른 rate는 libsoxr HQ로 변환합니다. 임의 탐색은 rational rate의 위상 주기에 맞춘 시작점과 양쪽 8192-output-frame warmup을 사용하며 요청 구간만 cache에 저장합니다. 파일 전체 PCM을 만들지 않습니다. 48 kHz는 변환 없이 읽습니다. slot 충돌·느린 디스크의 miss는 무음과 counter로 표시하며 먼 여러 offset을 동시에 읽는 scheduling 개선은 남아 있습니다. offline owner는 process 밖에서 prefetch를 기다립니다.
+DiskStream은 Media WavReader와 이를 조합합니다. 4096 frames × 512 slots = 16 MiB cache, atomic pin으로 RT reader와 disk worker를 분리합니다. 시작 256블록은 루프 복귀용으로 유지하고 나머지 256슬롯은 순환합니다. 256블록(약 21.8초)을 선행 요청하며 EOF 근처에서는 시작 구간까지 순환 준비합니다. 다른 rate는 libsoxr HQ로 변환합니다. 임의 탐색은 rational rate의 위상 주기에 맞춘 시작점과 양쪽 8192-output-frame warmup을 사용하며 요청 구간만 cache에 저장합니다. 파일 전체 PCM을 만들지 않습니다. 48 kHz는 변환 없이 읽습니다. slot 충돌·느린 디스크의 miss는 무음과 counter로 표시하며 먼 여러 offset을 동시에 읽는 scheduling 개선은 남아 있습니다. offline owner는 process 밖에서 요청 창 전체의 prefetch를 기다립니다.
 
 ## 녹음과 시간 정보
 
-CaptureSink → 약 8 MiB 고정 queue → DAW disk worker 경계를 사용합니다. native callback은 파일을 열거나 메모리를 할당하지 않습니다. 정확한 누락 frame 수가 있으면 `gap(frames)`를 전달해 duration을 보존하고 무음을 삽입합니다. 길이가 불명확한 gap은 `gap(0)`으로 표시하고 녹음을 중단하여 partial 파일을 보존합니다. ALSA recover를 조용히 이어 붙이지 않습니다.
+CaptureSink → 약 64 MiB 고정 queue → DAW disk worker 경계를 사용합니다. native callback은 파일을 열거나 메모리를 할당하지 않습니다. 정확한 누락 frame 수가 있으면 `gap(frames)`를 전달해 duration을 보존하고 무음을 삽입합니다. 길이가 불명확한 gap은 `gap(0)`으로 표시하고 녹음을 중단하여 partial 파일을 보존합니다. ALSA recover를 조용히 이어 붙이지 않습니다.
 
 입력 장치를 먼저 준비하고 capture gate와 transport를 시작합니다. 첫 capture의 audio clock과 packet 길이, transport anchor로 take 시작점을 계산합니다. 사용자가 선택한 native input/output 추정 지연과 실제 graph 지연을 차감하고 추가 manual offset을 적용합니다. 음수 시작은 파일을 바꾸지 않고 clip source offset으로 잘라냅니다. Input popup은 Estimated/Manual only와 ±1 ms offset, 입력 추정/PDC/queue/lost를 제공합니다. v7 문서에 설정을 저장합니다.
 
@@ -35,6 +35,8 @@ CaptureSink → 약 8 MiB 고정 queue → DAW disk worker 경계를 사용합�
 ## 네이티브 I/O
 
 Linux: ALSA output/capture worker, stop/drop/join. optional PipeWire discovery와 ALSA PipeWire PCM. capture latency는 실제 설정된 buffer 크기 기반 추정입니다. direct pw_stream/JACK/ASIO는 미구현입니다.
+
+선택적 `ALLY_AUDIO_RTKIT`는 libsystemd >=246이 있으면 input/output worker 시작 시에만 sd-bus로 RealtimeKit을 호출합니다. `process`와 capture 처리 중에는 IPC하지 않습니다. 서비스가 허용하는 범위에서 최대 priority 5의 RT 정책을 요청하고 실패하면 nice 우선순위를 요청합니다. D-Bus method timeout은 각 0.5초입니다. 서비스와 프로세스의 `RLIMIT_RTTIME`을 따르며 50ms 미만의 제한이면 RT 승격을 시도하지 않습니다. 시작 시 제한을 낮추는 것은 프로세스 전체에 영향을 줍니다. `BackendStats::realtimePriority`는 실제 SCHED_RR/FIFO 우선순위를 보고하며 0은 RT 미적용/미보고입니다. 서비스·권한이 없으면 정상 정책으로 남으며 성공으로 표시하지 않습니다. 이 선택 의존성의 자료형은 공개 API에 노출하지 않습니다.
 
 Windows: WASAPI shared/event-driven worker. GetBuffer device position의 전진 차이를 gap으로 전달하며 역행 또는 길이가 불명확한 discontinuity를 중단합니다. [Microsoft의 GetBuffer 계약](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)을 따릅니다.
 

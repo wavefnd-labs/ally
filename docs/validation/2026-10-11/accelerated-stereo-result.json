@@ -1,0 +1,9 @@
+{
+  "mode": "accelerated synthetic stereo, not real-time",
+  "storage": "SSD /dev/sdb3",
+  "file_bytes": 8294400080,
+  "pcm_sha256_file": "3900d12d7b62de09f9cf46362f1973e6716c199f34a16c3b5857f8b1c0d93934",
+  "result": "accelerated_only=1\nwall_seconds=116.25\nframes=1036800000\nreadback_frames=1036800000\nlost=0\nrf64=1\n",
+  "raw_fixture_retained": false,
+  "cleanup_reason": "Successful synthetic fixture removed after full verification and hashing to restore SSD free space; native and interrupted fixtures preserved."
+}

@@ -1,3 +1,4 @@
+#include "thread_priority.hpp"
 #include <algorithm>
 #include <ally/audio/capture.hpp>
 #include <alsa/asoundlib.h>
@@ -15,6 +16,7 @@ class AlsaCapture final : public Capture {
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> frames_{0}, xruns_{0};
     std::atomic<int64_t> error_{0};
+    std::atomic<uint32_t> priority_{0};
     uint32_t rate_ = 0, period_ = 0;
     double latencyMs_ = 0;
 
@@ -79,9 +81,11 @@ class AlsaCapture final : public Capture {
         latencyMs_ = double(size) * 1000 / rate_;
         frames_ = xruns_ = 0;
         error_ = 0;
+        priority_ = 0;
         running_ = true;
         thread_ = std::thread([this, &sink, config] {
             std::array<float, 16384> buffer{};
+            priority_ = requestAudioThreadPriority();
             while (running_.load()) {
                 auto count = snd_pcm_readi(pcm_, buffer.data(), config.bufferFrames);
                 if (count < 0) {
@@ -119,8 +123,8 @@ class AlsaCapture final : public Capture {
         }
     }
     BackendStats stats() const noexcept override {
-        return {rate_,         period_,         0,         frames_.load(), xruns_.load(), 0,
-                error_.load(), running_.load(), latencyMs_};
+        return {rate_,         period_,         0,          frames_.load(),  xruns_.load(), 0,
+                error_.load(), running_.load(), latencyMs_, priority_.load()};
     }
 };
 std::unique_ptr<Capture> makeNativeCapture() {

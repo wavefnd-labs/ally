@@ -16,6 +16,8 @@
 
 Qt/egui/JUCE/Sleepy/FFmpeg를 애플리케이션 의존성으로 사용하지 않습니다. Skia 구성에서도 ffmpeg 기본 비활성화를 유지합니다. SDL의 내부 GPU 모듈이 빌드되어도 UI는 SDL_GL API와 Skia Ganesh GL만 사용합니다.
 
+Linux에서는 선택적 libsystemd >=246의 sd-bus로 RealtimeKit에 오디오 스레드 우선순위를 요청합니다. `ALLY_AUDIO_RTKIT=OFF`로 제외할 수 있고 개발 패키지나 서비스·권한이 없으면 일반 스케줄링으로 동작합니다. 네이티브 오디오 I/O는 기존 자체 ALSA 백엔드입니다.
+
 ## 아직 결정하지 않은 사항
 
 프로젝트 오픈소스 라이선스, 플러그인 격리 전략, 프로젝트 장기 컨테이너, 실시간 graph worker scheduling, GPU의 플랫폼별 장기 Metal/Vulkan 전략, 백엔드 우선순위와 배포 패키지 정책은 미정입니다. 임시 텍스트 문서 형식, GL 3.3 desktop baseline과 ALSA 첫 출력은 이번 구현 결정이며 확정 스택을 대체하지 않습니다.

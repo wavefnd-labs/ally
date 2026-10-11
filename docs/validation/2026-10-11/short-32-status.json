@@ -1,0 +1,57 @@
+{
+  "state": "passed",
+  "requested_seconds": 90,
+  "tracks": 32,
+  "device": "pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo",
+  "directory": "/mnt/hdd/ally/build/soak/short-32-complete-20261011",
+  "supervisor_pid": 498750,
+  "started_utc": "2026-10-11T11:57:50.285978+00:00",
+  "binary_sha256": "4d2749f3622d609d01741ffedc2fb05445ba703e45f7307c5f1f7e8a8d8c1c56",
+  "git_head": "c6b15fc132e12f9bd1924a78e33e1b7b5901c4b9",
+  "peak_rss_kib": 673012,
+  "source_patch_sha256": "2a310d7c2812e24f817aa617e8941aa12c69b348f79fc52c2760b4b39a847b00",
+  "untracked_sources": {
+    "docs/LONG_RECORDING_VALIDATION.md": "26994bec0267c241aa1fbae7e44fa53ddf7b15e54f55159f7c99e645ee06026c",
+    "libs/audio/src/backend/thread_priority.cpp": "51cdf86ef4eee08156792afd5f2ea0526e9e1c78341c2cf78ef58f7ac91ce52b",
+    "libs/audio/src/backend/thread_priority.hpp": "ceb070f5188c4819b1912caf3170ef8fe16d44c9f6318d7964d666918eab9c42",
+    "tools/soak.py": "7d764d496e6132c6f83c2d9d6714e1bd22642b40254aa45361d87bd04a664949"
+  },
+  "test_pid": 498754,
+  "command": [
+    "/mnt/hdd/ally/build/release/stability_tests",
+    "--native",
+    "90",
+    "pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo",
+    "/mnt/hdd/ally/build/soak/short-32-complete-20261011",
+    "32"
+  ],
+  "updated_utc": "2026-10-11T12:00:16.220524+00:00",
+  "supervisor_elapsed_seconds": 150.893293273999,
+  "disk_available_bytes": 87275249664,
+  "fixture": "/mnt/hdd/ally/build/soak/short-32-complete-20261011/ally-stability-33031277849672",
+  "last_progress": "Native soak progress: elapsed_s=91.0001 capture=4364032 written=4316672 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.93682",
+  "progress": {
+    "elapsed_s": 91.0001,
+    "capture": 4364032,
+    "written": 4316672,
+    "lost": 0,
+    "queue_peak": 408064,
+    "input_xruns": 0,
+    "output_xruns": 0,
+    "stream_misses": 0,
+    "input_rt_priority": 5,
+    "output_rt_priority": 5,
+    "input_period": 256,
+    "output_period": 256,
+    "output_max_ms": 2.93682
+  },
+  "exit_code": 0,
+  "finished_utc": "2026-10-11T12:00:21.221081+00:00",
+  "log_sha256": "ecf81a5f59276057f9d4ebf18e14a3625be6837c8e3f563d73e9fb08f9115d06",
+  "last_log_lines": [
+    "Native soak progress: elapsed_s=60 capture=2877952 written=2874880 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.67027",
+    "Native soak progress: elapsed_s=90.0001 capture=4316160 written=4308480 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.93682",
+    "Native soak progress: elapsed_s=91.0001 capture=4364032 written=4316672 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.93682",
+    "Native soak passed: seconds=90 tracks=32 wall_s=91.0001 capture=4364032 lost=0 queue_peak=408064 output_xruns=0 output_max_ms=2.93682 readback_frames=139649024"
+  ]
+}

@@ -1,0 +1,7 @@
+OpenGL device: NVIDIA GeForce RTX 2060/PCIe/SSE2
+Renderer: SDL3 / Skia Ganesh OpenGL
+Audio: Offline preview (no device)
+MIDI device probing disabled in offline mode
+Window: OS native / x11 / title bar 37 px
+GPU screenshot: /tmp/ally-final-soak-ui.bmp
+UI smoke passed: GPU render, note editing, velocity, arrangement clips, undo/redo, master/channel faders, devices, search, loop/metronome, mute/solo, BPM, independent patterns, WAV import/trim/loop, save/open/export workers, audio settings, SDL transport, native window close

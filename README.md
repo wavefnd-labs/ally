@@ -12,7 +12,7 @@ C++23으로 만드는 Linux·Windows·macOS 데스크톱 전용 전문 DAW의 �
 
 Devices에는 채널별 Synth / Sampler / Drum machine 선택과 저장되는 파라미터를 연결했습니다. 신스는 sine·PolyBLEP saw·triangle, 샘플러는 root key 기준 피치 재생, 드럼 머신은 MIDI 36–51의 16개 키에 서로 다른 resident WAV 소스를 배정하는 one-shot입니다. 키보드 미리 듣기와 libremidi 입력을 선택 채널에 라우팅합니다. MIDI 입력 장치를 선택하고 Shift+R로 MIDI take를 녹음하면 4-beat 패턴과 Arrangement 클립으로 나눠 저장합니다.
 
-Samples / Ctrl+I / WAV drop으로 mono/stereo PCM 8/16/24/32-bit 및 float32 WAV를 가져옵니다. 8–384 kHz 파일의 실제 파형, source offset·Loop·Relink를 제공합니다. 작은 소스는 libsoxr로 48 kHz PCM을 준비합니다. 48 kHz 환산 2,097,152프레임(약 43.7초)을 넘으면 전체 PCM 대신 2 MiB 고정 캐시와 디스크 worker로 스트리밍합니다. 다른 sample rate도 libsoxr HQ 스트리밍으로 변환하며 탐색에서는 위상 정렬과 FIR warmup으로 블록 경계를 유지합니다. 파일 해시와 파형 분석은 가져오기 worker가 순차 스캔합니다.
+Samples / Ctrl+I / WAV drop으로 mono/stereo PCM 8/16/24/32-bit 및 float32 WAV를 가져옵니다. 8–384 kHz 파일의 실제 파형, source offset·Loop·Relink를 제공합니다. 작은 소스는 libsoxr로 48 kHz PCM을 준비합니다. 48 kHz 환산 2,097,152프레임(약 43.7초)을 넘으면 전체 PCM 대신 16 MiB 고정 캐시와 디스크 worker로 스트리밍합니다. 다른 sample rate도 libsoxr HQ 스트리밍으로 변환하며 탐색에서는 위상 정렬과 FIR warmup으로 블록 경계를 유지합니다. 파일 해시와 파형 분석은 가져오기 worker가 순차 스캔합니다.
 
 트랙 Arm → 상단 Record / R → OS 저장 위치 선택 → Stop으로 실제 네이티브 입력을 녹음합니다. 여러 armed 트랙을 동시에 stereo/left/right 입력으로 녹음하고 각 WAV를 해당 트랙의 클립으로 가져옵니다. `take.wav`를 선택하면 `take-track1.wav` 등으로 만들며 기존 파일은 덮어쓰지 않습니다. Devices Monitor는 선택 트랙의 믹싱 경로로 입력을 보냅니다. 캡처 콜백은 고정 SPSC 큐만 쓰고 worker가 8192프레임 단위로 기록합니다. 1초 header checkpoint, 5초 disk sync, 4 GiB 초과 시 RF64 전환과 worker 오류 조기 중단을 지원합니다. 현재 DAW take 길이 상한은 6시간이고 기존 Arrangement 끝에 도달해도 녹음을 계속합니다. 녹음/파일 작업 중 문서 편집을 잠시 막습니다.
 
@@ -115,8 +115,11 @@ ctest --test-dir build/media --output-on-failure
 ./build/release/ally --record-probe /tmp/long-take.wav --input-device "input-device-id" --record-seconds 65
 # 원본 partial을 유지하고 완전한 PCM frame을 새 파일로 복구
 ./build/release/ally --recover-recording /tmp/take.wav.partial.wav /tmp/recovered.wav
-# 선택적 실제 장치 5분 soak 및 고의 큐 과부하/4 GiB 경계 검사
+# 짧은 실제 장치 검사와 가속 데이터/고의 큐 과부하 검사
 ./build/release/stability_tests --native 300 "input-device-id" ./build/soak
+python3 tools/soak.py --seconds 90 --tracks 32 --device "input-device-id" --directory build/soak/new-short-32-run
+# stereo 약 8.29 GB를 실제 기록·전체 읽기. 실제 6시간 연속 녹음 검사가 아닙니다.
+./build/release/stability_tests --accelerated ./build/soak
 ./build/release/stability_tests --pressure
 ./build/release/libs/media/media_stream_tests --rf64-write
 ./build/debug/ally --view mixer
@@ -124,6 +127,8 @@ SDL_VIDEODRIVER=offscreen ./build/debug/ally --smoke --screenshot /tmp/workspace
 ```
 
 `--offline`은 장치 없이 재생 위치를 시뮬레이션하며 소리가 나지 않습니다. GUI도 SDL3/Skia GL로 렌더링합니다. 오디오 장치 개방 실패 시 오류를 표시하고 이 모드로 작동합니다. `--smoke`는 실제 렌더된 hit target으로 노트·velocity·클립 편집, Undo/Redo, 채널·Master fader, cutoff, mute/solo, BPM 입력, 검색, 채널 추가, loop/metronome·독립 패턴 생성/복제/이름 변경/할당·WAV import/trim/loop·파일 worker save/open/export·오디오 설정과 SDL 키보드 재생을 검사합니다. 다중 선택·clipboard·timeline 확장·악기 전환·EQ/bus·Arm·MIDI take의 UI 경로도 검사합니다. GUI smoke의 파일 선택 결과는 테스트 경로로 주입하며 OS 파일 선택기의 사람 조작 검증으로 해석하지 않습니다. EGL/OpenGL 드라이버가 없는 환경에서는 실패합니다.
+
+실제 6시간 녹음/32트랙 30분 검사는 컴퓨터를 밤새 켜두지 않는 사용자 조건에 따라 중단했습니다. 예약 추적과 검사 절전 차단도 중단했습니다. 가속 데이터 검사는 wall-clock 장시간 안정성을 대신하지 않습니다. 구체적인 실패·수정·관측 결과는 [별도 검사 기록](docs/LONG_RECORDING_VALIDATION.md)에 있습니다.
 
 ## 품질과 상태
 

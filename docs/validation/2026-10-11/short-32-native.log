@@ -1,0 +1,6 @@
+Native soak started: utc_epoch=1791719918 seconds=90 tracks=32 target_frames=4320000 device="pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo" fixture="/mnt/hdd/ally/build/soak/short-32-complete-20261011/ally-stability-33031277849672"
+Native soak progress: elapsed_s=30.0001 capture=1437952 written=1195520 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.67027
+Native soak progress: elapsed_s=60 capture=2877952 written=2874880 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.67027
+Native soak progress: elapsed_s=90.0001 capture=4316160 written=4308480 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.93682
+Native soak progress: elapsed_s=91.0001 capture=4364032 written=4316672 lost=0 queue_peak=408064 input_xruns=0 output_xruns=0 stream_misses=0 input_rt_priority=5 output_rt_priority=5 input_period=256 output_period=256 output_max_ms=2.93682
+Native soak passed: seconds=90 tracks=32 wall_s=91.0001 capture=4364032 lost=0 queue_peak=408064 output_xruns=0 output_max_ms=2.93682 readback_frames=139649024

@@ -53,6 +53,6 @@ Recorder는 CaptureSink와 bounded SPSC/disk worker를 연결해 여러 armed �
 
 ## 장시간 제작 경로
 
-capture callback은 약 8 MiB queue에만 쓰며 disk worker가 route별 8192-frame batch를 WAV/RF64에 기록합니다. UI는 queue peak/lost와 worker 실패를 공개 인터페이스로 확인합니다. 입력 준비 후 capture gate와 transport를 시작하고 첫 packet/audio-clock anchor에서 보정 위치를 계산합니다. take 중에는 준비 Plan의 재생 끝을 확장하되 미완성 문서를 무조건 변경하지 않고, 완료 파일을 worker에서 가져와 timeline을 확장합니다. 6시간 source/take와 131072 beats 범위를 검사합니다.
+capture callback은 약 64 MiB queue에만 쓰며 disk worker가 route별 8192-frame batch를 WAV/RF64에 기록합니다. UI는 queue peak/lost와 worker 실패를 공개 인터페이스로 확인합니다. 입력 준비 후 capture gate와 transport를 시작하고 첫 packet/audio-clock anchor에서 보정 위치를 계산합니다. take 중에는 준비 Plan의 재생 끝을 확장하되 미완성 문서를 무조건 변경하지 않고, 완료 파일을 worker에서 가져와 timeline을 확장합니다. 6시간 source/take와 131072 beats 범위를 검사합니다.
 
 HQ StreamingResampler는 선택적 Audio DSP 타깃이고 Project DiskStream이 Media WavReader와 조합합니다. path PDC는 현재 acyclic strip graph에서 actual lookahead와 bus path를 계산합니다. offline render는 동일 엔진을 flush하고 앞의 처리 지연을 제외합니다. external plugin graph·clock drift·물리 loopback 자동 측정은 다음 단계입니다.

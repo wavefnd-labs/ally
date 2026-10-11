@@ -1,0 +1,27 @@
+Test project /mnt/hdd/ally/build/release
+      Start  1: ally.stability
+ 1/11 Test  #1: ally.stability ...................   Passed    1.52 sec
+      Start  2: ally.production
+ 2/11 Test  #2: ally.production ..................   Passed    0.49 sec
+      Start  3: ally.project
+ 3/11 Test  #3: ally.project .....................   Passed    0.48 sec
+      Start  4: ally.workflow
+ 4/11 Test  #4: ally.workflow ....................   Passed    0.19 sec
+      Start  5: media.stream
+ 5/11 Test  #5: media.stream .....................   Passed    0.02 sec
+      Start  6: media.wav
+ 6/11 Test  #6: media.wav ........................   Passed    0.02 sec
+      Start  7: audio.resample
+ 7/11 Test  #7: audio.resample ...................   Passed    0.05 sec
+      Start  8: audio.production
+ 8/11 Test  #8: audio.production .................   Passed    0.06 sec
+      Start  9: audio.engine
+ 9/11 Test  #9: audio.engine .....................   Passed    0.12 sec
+      Start 10: audio.backend_contract
+10/11 Test #10: audio.backend_contract ...........   Passed    0.05 sec
+      Start 11: audio.c_abi
+11/11 Test #11: audio.c_abi ......................   Passed    0.02 sec
+
+100% tests passed, 0 tests failed out of 11
+
+Total Test time (real) =   3.08 sec
