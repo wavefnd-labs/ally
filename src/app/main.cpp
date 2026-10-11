@@ -451,7 +451,7 @@ int main(int argc, char **argv) {
         float observedPeak = 0;
         bool running = true, textActive = false, closePending = false, closeAfterSave = false;
         int frames = 0;
-        bool closeVerified = false;
+        bool closeVerified = false, keyboardVerified = false;
         auto last = SDL_GetTicksNS();
         double pendingFrames = 0;
         std::array<float, 512> scratch{};
@@ -502,7 +502,11 @@ int main(int argc, char **argv) {
                             workspace.editKey("backspace");
                         }
                     } else if (key == SDLK_SPACE) {
+                        const bool previous = engine.playing();
                         workspace.action("play");
+                        if (smoke && event.key.windowID == SDL_GetWindowID(window.get())) {
+                            keyboardVerified = engine.playing() != previous;
+                        }
                     } else if (key == SDLK_ESCAPE) {
                         workspace.action("stop");
                     } else if (key == SDLK_F5) {
@@ -673,10 +677,15 @@ int main(int argc, char **argv) {
                 renderer.verifyInteractions(workspace);
                 SDL_Event key{};
                 key.type = SDL_EVENT_KEY_DOWN;
+                key.key.windowID = SDL_GetWindowID(window.get());
+                key.key.scancode = SDL_SCANCODE_SPACE;
                 key.key.key = SDLK_SPACE;
-                SDL_PushEvent(&key);
+                key.key.down = true;
+                if (!SDL_PushEvent(&key)) {
+                    throw std::runtime_error("Cannot queue SDL keyboard smoke event");
+                }
             }
-            if (smoke && frames == 3 && !engine.playing()) {
+            if (smoke && frames == 9 && !keyboardVerified) {
                 throw std::runtime_error("SDL keyboard transport failed");
             }
             if (smoke && frames == 10) {
