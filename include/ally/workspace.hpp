@@ -70,7 +70,13 @@ class Workspace {
     }
     std::vector<audio::Device> audioDevices;
     audio::BackendConfig audioConfig;
-    audio::BackendStats audioStats;
+    audio::BackendStats audioStats, inputStats;
+    uint64_t recordingQueueHighWater = 0, recordingLostFrames = 0;
+    void audioRecordingState(bool value) {
+        recordingAudio = value;
+        dirty_ = true;
+        sync();
+    }
     std::string status = "Ready", backendStatus = "Offline", midiStatus;
     uint64_t midiDropped = 0;
     int selectedTrack() const {

@@ -24,6 +24,9 @@ enum class Instrument : uint8_t { Synth, Sampler, Drum };
 struct Strip {
     float pan = 0, lowDb = 0, midDb = 0, highDb = 0;
     float thresholdDb = 0, ratio = 4, delayWet = 0, delaySeconds = .25f, feedback = .3f;
+    // Actual lookahead delay, not an artistic echo. Included in every route's compensation.
+    uint32_t lookaheadFrames = 0;
+    static constexpr uint32_t maxLookahead = 2048;
     int route = -1;
     std::array<float, 4> sends{};
     bool operator==(const Strip &) const = default;
@@ -44,6 +47,7 @@ struct Plan {
                             maxBuses = 4;
     uint64_t loopFrames = 96000;
     uint32_t count = 0, sampleCount = 0, clickCount = 0;
+    double clickIntervalFrames = 0;
     uint64_t loopEndFrame = 0;
     float masterGain = 1;
     std::array<NoteEvent, capacity> notes{};
@@ -70,6 +74,8 @@ struct Plan {
         releases.fill(240);
     }
 };
+// Total prepared graph latency, including buses and master. No allocations.
+uint32_t planLatencyFrames(const Plan &) noexcept;
 struct MidiEvent {
     uint8_t key = 60;
     uint8_t velocity = 0;
@@ -91,6 +97,11 @@ template <typename T, size_t N> class SpscQueue {
         data_[w] = value;
         write_.store(next, std::memory_order_release);
         return true;
+    }
+    size_t size() const noexcept {
+        const auto r = read_.load(std::memory_order_acquire);
+        const auto w = write_.load(std::memory_order_acquire);
+        return (w + N - r) % N;
     }
     bool pop(T &value) noexcept {
         const auto r = read_.load(std::memory_order_relaxed);
@@ -121,6 +132,9 @@ class Engine {
         return clock_.load();
     }
     uint64_t timestamp() const noexcept;
+    uint32_t latencyFrames() const noexcept {
+        return graphLatency_.load();
+    }
     uint64_t streamUnderruns() const noexcept;
     // One native capture producer. Monitor is consumed by the sole output owner.
     void monitorInput(std::span<const float> stereo) noexcept;
@@ -201,10 +215,24 @@ class Engine {
         float envelope = 0;
         size_t cursor = 0, delayValid = 0;
         std::vector<std::array<float, 2>> delay;
+        std::vector<std::array<float, 2>> lookahead;
+        size_t lookaheadCursor = 0, lookaheadValid = 0;
     };
     std::array<DspState, Plan::maxTracks + Plan::maxBuses + 1> dsp_;
     std::array<float, Plan::maxTracks + Plan::maxBuses + 1> lowGain_{}, midGain_{}, highGain_{},
         thresholds_{};
+    static constexpr size_t destinations = Plan::maxBuses + 1;
+    static constexpr size_t nodes = Plan::maxTracks + Plan::maxBuses + 1;
+    static constexpr size_t maxCompensation = Strip::maxLookahead * (Plan::maxBuses + 1);
+    struct Alignment {
+        uint32_t frames = 0;
+        size_t cursor = 0, valid = 0;
+    };
+    std::array<Alignment, nodes * destinations> alignment_{};
+    std::vector<std::array<float, 2>> alignmentStorage_;
+    std::atomic<uint32_t> graphLatency_{0};
+    std::array<float, 2> align(std::array<float, 2>, size_t source, size_t destination) noexcept;
+    void prepareAlignment() noexcept;
     void coefficients() noexcept;
     void resetDsp() noexcept;
     std::array<float, 2> processStrip(std::array<float, 2>, const Strip &, size_t) noexcept;

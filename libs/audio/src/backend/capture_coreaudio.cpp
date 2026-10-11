@@ -197,6 +197,7 @@ class CoreAudioCapture final : public Capture {
         sink_ = &sink;
         channels_ = config.channels;
         capture_.resize(size_t(maximum) * channels_);
+        expectedSample_ = -1;
         frames_ = xruns_ = maxNs_ = 0;
         error_ = 0;
         active_ = true;
@@ -231,8 +232,8 @@ class CoreAudioCapture final : public Capture {
         sink_ = nullptr;
     }
     BackendStats stats() const noexcept override {
-        return {rate_,         buffer_,       latencyMs_,    frames_.load(),
-                xruns_.load(), maxNs_.load(), error_.load(), active_.load()};
+        return {rate_,         buffer_,        0,         frames_.load(), xruns_.load(), maxNs_.load(),
+                error_.load(), active_.load(), latencyMs_};
     }
 
   private:
@@ -271,6 +272,16 @@ class CoreAudioCapture final : public Capture {
             self.active_ = false;
             return code;
         }
+        if (time->mFlags & kAudioTimeStampSampleTimeValid) {
+            const double sample = time->mSampleTime;
+            if (!std::isfinite(sample) || sample < 0) {
+                self.sink_->gap(0);
+            } else if (self.expectedSample_ >= 0 && sample != self.expectedSample_) {
+                self.xruns_.fetch_add(1);
+                self.sink_->gap(sample > self.expectedSample_ ? uint64_t(sample - self.expectedSample_) : 0);
+            }
+            self.expectedSample_ = sample + frames;
+        }
         self.sink_->capture(std::span(self.capture_).first(size_t(frames) * self.channels_), self.channels_);
         self.frames_.fetch_add(frames);
         return noErr;
@@ -281,7 +292,7 @@ class CoreAudioCapture final : public Capture {
     std::vector<float> capture_;
     uint16_t channels_ = 2;
     uint32_t rate_ = 0, buffer_ = 0;
-    double latencyMs_ = 0;
+    double latencyMs_ = 0, expectedSample_ = -1;
     bool listening_ = false, overloadListening_ = false;
     std::atomic<bool> active_{false};
     std::atomic<uint64_t> frames_{0}, xruns_{0}, maxNs_{0};

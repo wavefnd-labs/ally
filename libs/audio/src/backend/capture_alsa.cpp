@@ -16,6 +16,7 @@ class AlsaCapture final : public Capture {
     std::atomic<uint64_t> frames_{0}, xruns_{0};
     std::atomic<int64_t> error_{0};
     uint32_t rate_ = 0, period_ = 0;
+    double latencyMs_ = 0;
 
   public:
     ~AlsaCapture() override {
@@ -75,6 +76,7 @@ class AlsaCapture final : public Capture {
         snd_pcm_get_params(pcm_, &size, &period);
         rate_ = config.sampleRate;
         period_ = uint32_t(period);
+        latencyMs_ = double(size) * 1000 / rate_;
         frames_ = xruns_ = 0;
         error_ = 0;
         running_ = true;
@@ -87,6 +89,7 @@ class AlsaCapture final : public Capture {
                         break;
                     }
                     xruns_.fetch_add(1);
+                    sink.gap(0); // ALSA recovery cannot report the exact number of discarded frames.
                     int rc = snd_pcm_recover(pcm_, int(count), 1);
                     if (rc < 0) {
                         error_ = rc;
@@ -116,7 +119,8 @@ class AlsaCapture final : public Capture {
         }
     }
     BackendStats stats() const noexcept override {
-        return {rate_, period_, 0, frames_.load(), xruns_.load(), 0, error_.load(), running_.load()};
+        return {rate_,         period_,         0,         frames_.load(), xruns_.load(), 0,
+                error_.load(), running_.load(), latencyMs_};
     }
 };
 std::unique_ptr<Capture> makeNativeCapture() {

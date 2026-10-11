@@ -238,5 +238,21 @@ int main() {
         CHECK(value == i);
     }
     producer.join();
+    {
+        Engine compensated;
+        auto plan = std::make_unique<Plan>();
+        plan->loopFrames = 48000;
+        plan->strips[0].lookaheadFrames = 240;
+        plan->strips[1].route = 0;
+        plan->buses[0].lookaheadFrames = 480;
+        CHECK(compensated.submit(*plan));
+        compensated.play(true);
+        forbidNew = true;
+        compensated.process(b);
+        compensated.seek(10000);
+        compensated.process(b);
+        forbidNew = false;
+        CHECK(compensated.latencyFrames() == 480);
+    }
     std::cout << "sample boundaries, transport, live notes, validation and 100000 SPSC transfers passed\n";
 }

@@ -60,12 +60,14 @@ struct Track {
     bool operator==(const Track &) const = default;
 };
 struct Project {
-    static constexpr double maxTimeline = 1024;
+    static constexpr double maxTimeline = 131072;
     double bpm = 124, timelineBeats = 32, loopBeats = 24;
     std::array<audio::Strip, audio::Plan::maxBuses> buses{};
     std::array<float, audio::Plan::maxBuses> busGains{1, 1, 1, 1};
     audio::Strip masterStrip{};
     float masterGain = .78f;
+    bool automaticRecordLatency = true;
+    int recordOffsetFrames = 0;
     bool masterMuted = false, songMode = true, loop = true, metronome = false;
     std::vector<Track> tracks;
     std::vector<AudioSource> sources;

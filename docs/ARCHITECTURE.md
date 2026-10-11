@@ -39,9 +39,9 @@ sequencer compile은 현재 project.cpp에 작고 응집된 구현으로 존재�
 
 ## 확장 원칙
 
-현재 문서는 최대 32트랙, 트랙마다 32개의 독립 4-beat 패턴과 최대 1,024-beat Arrangement의 자유 위치·길이 클립을 갖습니다. 클립은 패턴 ID 또는 오디오 소스 ID를 참조합니다. 초기 문서는 사용자 HTML의 5채널 배치를 사용합니다. 내장 Texture와 짧은 WAV는 immutable PCM, 긴 WAV는 고정 캐시 SampleStream 소스이며 파형 peak cache는 작업 단계에서 생성합니다. 소스 경로·원본 sample rate/frame 수·PCM fingerprint를 저장해 누락/변경 파일을 알립니다. 같은 클립을 유지하고 무음으로 복원하며 사용자가 Relink한 뒤 새 데이터를 채택합니다.
+현재 문서는 최대 32트랙, 트랙마다 32개의 독립 4-beat 패턴과 최대 131,072-beat Arrangement의 자유 위치·길이 클립을 갖습니다. 클립은 패턴 ID 또는 오디오 소스 ID를 참조합니다. 초기 문서는 사용자 HTML의 5채널 배치를 사용합니다. 내장 Texture와 짧은 WAV는 immutable PCM, 긴 WAV는 고정 캐시 SampleStream 소스이며 파형 peak cache는 작업 단계에서 생성합니다. 소스 경로·원본 sample rate/frame 수·PCM fingerprint를 저장해 누락/변경 파일을 알립니다. 같은 클립을 유지하고 무음으로 복원하며 사용자가 Relink한 뒤 새 데이터를 채택합니다.
 
-버전 6 저장은 독립 패턴·소스와 mixer/device/loop 상태를 포함하며 이전 버전 1–5를 읽습니다. 문서 크기는 1 MiB, 소스 count와 note/event count를 검증한 뒤 외부 파일을 엽니다. 가져오기·열기 실패는 기존 문서를 교체하지 않습니다. 파일 선택은 SDL3 OS dialog callback의 mailbox를 통해 메인 스레드로 전달합니다. atomic save는 same-directory 임시 파일 flush 후 OS replacement를 수행합니다. DocumentSession은 saved/dirty/recovery 상태를 추적하며 각 실행 인스턴스는 서로 다른 recovery 경로와 OS lease를 사용합니다. live lease가 있는 복구본은 건드리지 않습니다. Undo/Redo는 64개 snapshot이며 drag 한 번을 한 변경으로 취급합니다. 패턴 선택은 Pattern mode의 재생 계획과 저장한 activePattern을 바꾸므로 문서 이력을 남깁니다.
+버전 7 저장은 룩어헤드·녹음 보정과 독립 패턴·소스와 mixer/device/loop 상태를 포함하며 이전 버전 1–6를 읽습니다. 문서 크기는 1 MiB, 소스 count와 note/event count를 검증한 뒤 외부 파일을 엽니다. 가져오기·열기 실패는 기존 문서를 교체하지 않습니다. 파일 선택은 SDL3 OS dialog callback의 mailbox를 통해 메인 스레드로 전달합니다. atomic save는 same-directory 임시 파일 flush 후 OS replacement를 수행합니다. DocumentSession은 saved/dirty/recovery 상태를 추적하며 각 실행 인스턴스는 서로 다른 recovery 경로와 OS lease를 사용합니다. live lease가 있는 복구본은 건드리지 않습니다. Undo/Redo는 64개 snapshot이며 drag 한 번을 한 변경으로 취급합니다. 패턴 선택은 Pattern mode의 재생 계획과 저장한 activePattern을 바꾸므로 문서 이력을 남깁니다.
 
 향후 command/transaction, tempo-map, automation, node graph를 추가합니다. graph compilation, buffer reservation, latency topology, DSP initialization은 control/worker 단계에서 끝내고 audio 단계는 준비된 plan만 실행합니다. plugin binary ABI는 내부 C++ 객체 주소를 노출하지 않습니다. 플랫폼 backend는 별도 파일/타깃으로 유지합니다. 모바일/Web/BSD는 지원 범위에서 제외합니다.
 
@@ -50,3 +50,9 @@ sequencer compile은 현재 project.cpp에 작고 응집된 구현으로 존재�
 Project Track에 instrument/source/drum key map/record arm/input routing와 strip parameter, Project에 timeline/bus/master strip이 추가됩니다. Editing은 UI와 분리된 그룹/clipboard 변경 API입니다. MIDI Take는 libremidi에 의존하지 않는 clock-based 문서 recorder이며 libremidi Input은 포트·메시지만 전달합니다.
 
 Recorder는 CaptureSink와 bounded SPSC/disk worker를 연결해 여러 armed 트랙 WAV를 동시에 생성하고 완료 파일만 importer에 보냅니다. Stream adapter는 독립 Media WavReader를 audio SampleStream으로 연결하며 엔진에서 파일·문서·외부 라이브러리 타입을 노출하지 않습니다. offline render는 별도 stream instance를 열어 live cache와 경쟁하지 않습니다.
+
+## 장시간 제작 경로
+
+capture callback은 약 8 MiB queue에만 쓰며 disk worker가 route별 8192-frame batch를 WAV/RF64에 기록합니다. UI는 queue peak/lost와 worker 실패를 공개 인터페이스로 확인합니다. 입력 준비 후 capture gate와 transport를 시작하고 첫 packet/audio-clock anchor에서 보정 위치를 계산합니다. take 중에는 준비 Plan의 재생 끝을 확장하되 미완성 문서를 무조건 변경하지 않고, 완료 파일을 worker에서 가져와 timeline을 확장합니다. 6시간 source/take와 131072 beats 범위를 검사합니다.
+
+HQ StreamingResampler는 선택적 Audio DSP 타깃이고 Project DiskStream이 Media WavReader와 조합합니다. path PDC는 현재 acyclic strip graph에서 actual lookahead와 bus path를 계산합니다. offline render는 동일 엔진을 flush하고 앞의 처리 지연을 제외합니다. external plugin graph·clock drift·물리 loopback 자동 측정은 다음 단계입니다.

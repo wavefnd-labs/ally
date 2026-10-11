@@ -334,7 +334,14 @@ void Workspace::recorded(std::vector<RecordedFile> files, double startBeat, uint
             result.lostFrames = lostFrames;
             for (const auto &file : files) {
                 if (file.frames) {
-                    result.project.importWav(file.path, file.track, startBeat);
+                    const double trimSeconds = std::max(0.0, -startBeat * 60 / snapshot.bpm);
+                    if (trimSeconds * 48000 >= file.frames) {
+                        continue;
+                    }
+                    result.project.importWav(file.path, file.track, std::max(0.0, startBeat));
+                    auto &clip = result.project.tracks[file.track].clips.back();
+                    clip.sourceOffset = trimSeconds;
+                    clip.length = std::max(.25, clip.length - trimSeconds * snapshot.bpm / 60);
                 }
             }
             return result;
@@ -420,7 +427,14 @@ bool Workspace::sync() {
     }
     if (dirty_ && project_.valid()) {
         try {
-            if (engine_.submit(project_.prepare(engine_))) {
+            auto plan = project_.prepare(engine_);
+            if (recordingAudio) {
+                // Disk recording is not limited by the current arrangement's visible end.
+                plan.loopFrames =
+                    std::max(plan.loopFrames, engine_.position() + uint64_t(engine_.sampleRate()) * 21600);
+                plan.loopEndFrame = 0;
+            }
+            if (engine_.submit(plan)) {
                 dirty_ = false;
             }
         } catch (const std::exception &error) {
@@ -476,7 +490,10 @@ void Workspace::draw(SkCanvas &c, float w, float h) {
     tool(c, {102, 14.5, 29, 29}, engine_.playing() ? "@pause" : "@play", "play", true, true, "Play / Pause");
     tool(c, {133, 14.5, 29, 29}, "@record", "record", recordingAudio || recordingMidi, !busy(),
          "Record armed audio tracks; Shift+R records MIDI");
-    double beat = double(engine_.position()) / (engine_.sampleRate() * 60.0 / project_.bpm);
+    const auto position = engine_.position();
+    const auto latency = engine_.latencyFrames();
+    double beat = double(engine_.playing() ? (position > latency ? position - latency : 0) : position) /
+                  (engine_.sampleRate() * 60.0 / project_.bpm);
     char clock[32];
     std::snprintf(clock, sizeof(clock), "%02d.%d.%d", int(beat / 4) + 1, int(std::fmod(beat, 4)) + 1,
                   int(std::fmod(beat, 1) * 4) + 1);
@@ -834,9 +851,10 @@ void Workspace::menu(SkCanvas &c) {
         return;
     }
     const float width = std::min(410.0f, width_ - 20);
-    const float height = audioMenu_ ? 430 : 370;
+    const float height = audioMenu_ || inputMenu_ ? 430 : 370;
     Rect r{width_ - width - 10,
-           std::clamp(audioMenu_ ? 60.0f : divider_.y - height, 62.0f, height_ - height - 30), width, height};
+           std::clamp(audioMenu_ || inputMenu_ ? 60.0f : divider_.y - height, 62.0f, height_ - height - 30),
+           width, height};
     menuRect_ = r;
     box(c, r, head);
     outline(c, r, 0xff656661);
@@ -871,6 +889,27 @@ void Workspace::menu(SkCanvas &c) {
                      inputDevices[i].name.substr(0, 57), "input:" + inputDevices[i].id,
                      inputConfig.deviceId == inputDevices[i].id);
             }
+            tool(c, {r.x + 8, r.y + 261, width - 16, 24},
+                 project_.automaticRecordLatency ? "Record compensation: Estimated"
+                                                 : "Record compensation: Manual only",
+                 "record-latency-auto", project_.automaticRecordLatency, !recordingAudio);
+            text(c, "Additional offset: " + number(double(project_.recordOffsetFrames) / 48) + " ms",
+                 r.x + 12, r.y + 305, 10);
+            tool(c, {r.x + width - 133, r.y + 288, 38, 24}, "−", "record-offset:-48", false, !recordingAudio,
+                 "Move take later by 1 ms");
+            tool(c, {r.x + width - 91, r.y + 288, 38, 24}, "＋", "record-offset:48", false, !recordingAudio,
+                 "Move take earlier by 1 ms");
+            tool(c, {r.x + width - 49, r.y + 288, 38, 24}, "0", "record-offset-reset", false,
+                 !recordingAudio);
+            text(c,
+                 "Input estimate " + number(inputStats.inputLatencyMs) + " ms / PDC " +
+                     std::to_string(engine_.latencyFrames()) + " samples",
+                 r.x + 12, r.y + 332, 10, dim);
+            text(c,
+                 "Queue peak " + std::to_string(recordingQueueHighWater) + " / lost " +
+                     std::to_string(recordingLostFrames) + " frames",
+                 r.x + 12, r.y + 354, 10, dim);
+            text(c, "Hardware loopback calibration is not automatic", r.x + 12, r.y + 375, 10, dim);
         } else {
             const size_t begin = size_t(midiPage_) * 8;
             for (size_t i = begin; i < std::min(begin + 8, midiPorts.size()); ++i) {
@@ -882,7 +921,8 @@ void Workspace::menu(SkCanvas &c) {
         }
         tool(c, {r.x + 8, r.y + 230, width - 16, 24}, "Next devices", inputMenu_ ? "input-page" : "midi-page",
              false, (inputMenu_ ? inputDevices.size() : midiPorts.size()) > 8);
-        tool(c, {r.x + 8, r.y + 290, width - 16, 24}, "Back to audio output", "audio-settings");
+        tool(c, {r.x + 8, r.y + (inputMenu_ ? 392 : 290), width - 16, 24}, "Back to audio output",
+             "audio-settings");
     } else {
         text(c, "AUDIO OUTPUT", r.x + 12, r.y + 20, 11, ink, true);
         const auto begin = size_t(std::max(0, devicePage_)) * 8;
@@ -902,7 +942,8 @@ void Workspace::menu(SkCanvas &c) {
         }
         text(c,
              "Device buffer: " + std::to_string(audioStats.bufferFrames) + " frames / latency " +
-                 number(audioStats.outputLatencyMs) + " ms",
+                 number(audioStats.outputLatencyMs) + " ms + " + std::to_string(engine_.latencyFrames()) +
+                 " PDC",
              r.x + 12, r.y + 331, 10);
         text(c,
              "XRUNs: " + std::to_string(audioStats.underruns) + " / process max " +
@@ -1088,7 +1129,9 @@ void Workspace::devices(SkCanvas &c, Rect r) {
                  x + 10, r.y + 149, 10);
         } else {
             text(c, "Threshold " + number(track.strip.thresholdDb) + " dB", x + 10, r.y + 128, 10);
-            text(c, "Delay " + number(track.strip.delaySeconds * 1000) + " ms", x + 10, r.y + 149, 10);
+            tool(c, {x + 8, r.y + 136, cardW - 16, 23},
+                 "Lookahead " + number(double(track.strip.lookaheadFrames) / 48) + " ms", "lookahead", false,
+                 true, "Cycle 0 / 2 / 5 / 10 ms; mixer routes compensate automatically");
             tool(c, {x + 8, r.y + 167, cardW - 16, 23},
                  project_.buses[0].delayWet > 0 ? "Bus 1 delay: On" : "Bus 1 delay: Off", "bus-delay",
                  project_.buses[0].delayWet > 0);
@@ -1184,7 +1227,9 @@ void Workspace::action(const std::string &act) {
             return;
         }
         if ((recordingAudio || recordingMidi) && act != "stop" && act != "record" && act != "record-midi" &&
-            act != "piano" && act != "devices" && act != "mixer") {
+            act != "piano" && act != "devices" && act != "mixer" && act != "audio-settings" &&
+            act != "input-settings" && act != "input-page" && act != "midi-settings" && act != "midi-page" &&
+            act != "device-page") {
             status = "Stop the take before editing the document";
             return;
         }
@@ -1487,6 +1532,16 @@ void Workspace::action(const std::string &act) {
             arrangementScroll_ = 0;
             document_.opened(project_, {});
             status = "New project";
+        } else if (act == "record-latency-auto") {
+            project_.automaticRecordLatency = !project_.automaticRecordLatency;
+        } else if (act.starts_with("record-offset:")) {
+            project_.recordOffsetFrames =
+                std::clamp(project_.recordOffsetFrames + std::stoi(act.substr(14)), -48000, 48000);
+        } else if (act == "record-offset-reset") {
+            project_.recordOffsetFrames = 0;
+        } else if (act == "lookahead") {
+            auto &frames = project_.tracks[size_t(selected_)].strip.lookaheadFrames;
+            frames = frames == 0 ? 96 : frames == 96 ? 240 : frames == 240 ? 480 : 0;
         } else if (act == "extend-timeline") {
             project_.timelineBeats = std::min(Project::maxTimeline, project_.timelineBeats + 32);
         } else if (act == "loop-to-end") {
@@ -1672,7 +1727,12 @@ void Workspace::press(float x, float y, bool right, bool additive) {
     }
     if (recordingAudio || recordingMidi) {
         for (const auto &b : buttons_) {
-            if ((b.action == "record" || b.action == "stop") && b.rect.contains(x, y)) {
+            const bool diagnostic = b.action == "audio-settings" || b.action == "input-settings" ||
+                                    b.action == "input-page" || b.action == "device-page" ||
+                                    b.action == "midi-settings" || b.action == "midi-page" ||
+                                    b.action == "piano" || b.action == "devices" || b.action == "mixer";
+            if (b.enabled && (b.action == "record" || b.action == "stop" || diagnostic) &&
+                b.rect.contains(x, y)) {
                 action(b.action);
                 return;
             }
@@ -2184,6 +2244,18 @@ void Workspace::verifyInteractions(SkCanvas &c, float w, float h) {
     release();
     check(project_.tracks[0].strip.lowDb > 0, "EQ control failed");
     action("undo");
+    click("lookahead");
+    check(project_.tracks[0].strip.lookaheadFrames == 96, "Lookahead control failed");
+    action("undo");
+    click("audio-settings");
+    click("input-settings");
+    click("record-latency-auto");
+    check(!project_.automaticRecordLatency, "Record compensation toggle failed");
+    action("undo");
+    click("record-offset:48");
+    check(project_.recordOffsetFrames == 48, "Record offset failed");
+    action("undo");
+    click("audio-settings");
     click("bus-delay");
     check(project_.buses[0].delayWet > 0, "Bus effect failed");
     action("undo");

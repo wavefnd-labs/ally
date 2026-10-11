@@ -1,27 +1,29 @@
 # 독립 멀티미디어 프레임워크
 
-`Ally::Media`는 프로젝트/UI/audio 의존성이 없는 C++23 모듈입니다. PCM은 sampleRate/channels와 interleaved float vector로 표현합니다. I/O와 모든 vector 메모리는 비실시간 용도입니다.
+`Ally::Media`는 Project/UI/Audio에 의존하지 않는 C++23 모듈입니다. PCM은 rate/channels와 interleaved float로 표현하며 모든 I/O는 비실시간입니다. FFmpeg 의존성은 없습니다.
 
-## 현재 구현
+## WAV / RF64
 
-RIFF little-endian WAV를 span으로 파싱하고 PCM unsigned8/signed16/signed24/signed32 및 IEEE float32를 float PCM으로 디코딩합니다. 최대 64채널, 8–384 kHz를 검사합니다. 기존 vector writer는 PCM16 WAV를 출력합니다. 별도 WavWriter는 mono/multichannel float32 WAV를 순차 기록합니다. 앱은 export와 CLI inspect에서 이를 사용합니다.
+span decoder와 seekable WavReader는 RIFF/WAVE 및 RF64의 단일 oversized data chunk를 읽습니다. RF64는 선행 ds64의 64-bit RIFF/data/sample count와 sentinel을 검사합니다. PCM unsigned8/signed16/24/32 및 float32, 1–64 channels, 8–384 kHz를 지원합니다. 청크 경계·padding·중복 fmt/data/ds64·byte rate/alignment·불완전 frame·비정상 float를 거절합니다. 알려지지 않은 bounded chunk는 건너뜁니다.
 
-청크 길이는 부모 RIFF 경계 내부에 있어야 합니다. chunk padding, fmt/data 중복, byte rate/block alignment, partial frame, 비정상 sample을 검사합니다. 알 수 없는 청크는 유효 경계 안에서 건너뜁니다. data가 fmt보다 먼저 와도 처리합니다. 파일/입력 크기를 512 MiB로 제한하며 whole-file decode의 크기 제한입니다. 별도 WavReader는 RIFF 32-bit 범위 안에서 큰 파일을 순차/seek 디코딩합니다. 실패는 구체적인 std::runtime_error로 전달합니다.
+whole-file decode는 512 MiB 제한이며 streaming read는 최대 65536 frames만 준비합니다. RF64 크기는 파일 크기와 signed 64-bit seek 범위로 검사합니다. 여러 oversized chunk를 위한 ds64 table은 명시적으로 미지원입니다. `decodeWav(span)`은 추후 fuzz harness 진입점입니다.
 
-순수 `decodeWav(span<const byte>)` 경계가 추후 libFuzzer/AFL harness 진입점입니다. 현재는 모든 유효 WAV prefix의 절단, 손상 header, odd chunk padding 및 4000 deterministic random malformed input을 테스트합니다. 이는 지속적 퍼징을 대신하지 않습니다.
+## 장시간 기록
 
-## 미지원
+WavWriter는 float32를 순차 기록합니다. 시작 시 80-byte header에 JUNK 공간을 예약하며 32-bit RIFF 크기를 넘으면 같은 위치를 RF64/ds64로 전환합니다. 데이터 이동이나 파일 전체 복사가 없습니다. append당 최대 65536 frames, 변환 byte buffer는 생성 시 한 번 준비합니다. writer는 복사할 수 없습니다.
 
-RF64/ds64, AIFF/AIFC, WAVE_FORMAT_EXTENSIBLE, PCM endian 변환 general API, channel masks, metadata 유지, FLAC/MP3/Opus/AAC, 비디오, hardware acceleration은 미구현입니다. RF64/AIFF 입력을 RIFF인 것처럼 해석하지 않고 명시적으로 거절합니다.
+PCM을 flush한 뒤 1초 단위로 header size를 갱신하고 5초 단위 및 finish에서 POSIX fsync / Windows _commit을 수행합니다. 정상 finish는 close 오류까지 검사합니다. 디스크/flush/seek 오류를 예외로 보고하며 DAW는 `.partial.wav`를 보존합니다. fsync는 OS의 저장 완료 요청이고 정전·불량 저장장치까지 보증하지 않습니다.
 
-## 다음 설계
+Recorder worker는 8192 frames 단위로 각 route를 batch하며 낮은 입력량에서는 200 ms 단위로 flush합니다. callback queue overflow와 알려진 native gap은 위치를 유지한 무음으로 기록합니다. worker 오류를 UI에서 조기에 확인합니다. DAW source와 take는 현재 6시간 제한이지만 독립 Media writer 자체는 RIFF 4 GiB 제한을 넘는 RF64를 지원합니다.
 
-seekable byte source와 streaming reader를 분리하고 bounds-checked chunk reader를 공통화합니다. RF64는 64-bit ds64와 chunk table, AIFF는 big-endian FORM/COMM/SSND와 80-bit sample rate를 엄격히 처리합니다. PCM scalar reference kernel에 Highway SIMD를 추가하고 비디오/codec registry를 독립 API로 확장합니다. FFmpeg 의존성은 도입하지 않습니다.
+## 중단 파일 복구
 
-WAV 가져오기와 소스 추적은 Project 계층이 이 독립 decode API를 호출하여 수행합니다. mono/stereo 선택과 libsoxr sample-rate 변환은 준비 단계의 Audio/Project 조합이며 미디어 라이브러리가 UI/문서/오디오 엔진에 의존하지 않습니다. 파일 경로, 누락/변경 검사와 캐시 ownership도 Project 계층에 둡니다.
+`recoverRecording(partial, newDestination)`은 Ally writer의 고정 header만 허용하고 원본을 변경하지 않습니다. 실제 파일 길이의 완전한 frame만 순차 읽고 float 검증을 거쳐 새 WAV/RF64에 기록합니다. checkpoint 이후의 데이터도 복원하고 마지막 불완전 frame은 제외합니다. 기존 목적지에는 기록하지 않습니다. 오류가 나면 원본과 미완료 목적지를 남깁니다. 녹음 중인 파일에는 실행하지 않아야 합니다.
 
-## 순차 I/O
+앱 CLI는 `ally --recover-recording take.wav.partial.wav recovered.wav`를 제공합니다. 자동 take 복구 UI와 여러 트랙 복구 transaction은 아직 없습니다. 완료 파일의 atomic replacement는 Project 플랫폼 file layer가 담당합니다.
 
-WavReader는 fmt/data/RIFF/padding/byte-rate/frame alignment를 파일 크기와 비교해 검증하고 최대 65536-frame read만 할당합니다. 일반 PCM decoder와 같은 unsigned8/signed16/24/32/IEEE float32를 지원하며 data-before-fmt도 허용합니다. WavWriter는 append/finish로 RIFF size를 갱신하고 RIFF 32-bit 크기를 넘기기 전에 실패합니다. 1초마다 header를 checkpoint하며 앱에서 capture queue를 소비하는 disk worker와 streaming offline export가 사용합니다. malformed/truncated file, seek boundary, multi-track write 회귀를 검사합니다.
+## 미지원과 다음 단계
 
-Project가 fingerprint·1024-bin waveform을 순차 스캔하고 작은 PCM에는 libsoxr HQ, 큰 source에는 48 kHz cache worker를 선택합니다. Media에는 UI/Project/Audio dependency가 없습니다. long stream의 rate conversion은 현재 선형 보간이고 연속 libsoxr DSP 처리는 향후 추가합니다. atomic completed file replacement는 Project의 플랫폼 file layer가 담당합니다.
+AIFF/AIFC, WAVE_FORMAT_EXTENSIBLE/channel mask, RF64 ds64 table, metadata 보존, 일반 PCM endian API, FLAC/MP3/Opus/AAC, 비디오/하드웨어 가속은 미구현입니다. 다음 단계는 seekable byte source·공통 chunk reader, AIFF의 big-endian/80-bit rate 검증, 지속적 fuzz CI, 실제 DSP 경로에 필요한 Highway/PFFFT 통합입니다.
+
+Project의 fingerprint/1024-bin 파형 스캔과 libsoxr HQ 캐시 변환은 독립 Media 위에서 조합합니다. 공개 API에 다른 라이브러리의 자료형을 노출하지 않습니다. 검증 근거는 VALIDATION.md에 기록합니다.

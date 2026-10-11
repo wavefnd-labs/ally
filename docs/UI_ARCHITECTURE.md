@@ -46,8 +46,14 @@ UI → Project::prepare/compile → Engine::submit 공개 인터페이스를 사
 
 Editing model은 note/clip selection과 clipboard를 소유하고 group transform의 이동 한계를 전체 선택에서 계산합니다. Shift toggle/marquee, Ctrl+A/C/X/V/D, Delete와 화살표 입력이 실제 문서 transaction에 연결됩니다. move 전체를 drag 이전 snapshot에서 계산해 cumulative drift를 피하며 commit 하나가 Undo 하나입니다. 복사된 MIDI clip을 다른 트랙에 붙일 때 원본 트랙+pattern ID로 패턴 복제를 구분합니다. Clipboard 종류는 editor selection과 따로 보존하며 다른 문서에서도 패턴/오디오 소스를 유지합니다. 잘못된 selection index는 문서를 바꾸기 전에 거절합니다.
 
-기본 8마디 viewport는 유지하고 Arrangement +8 bars, zoom 및 horizontal scroll로 최대 256마디를 편집합니다. offscreen clip과 파형 pixel은 cull합니다. 32트랙 색상은 기존 8색 palette를 반복합니다.
+기본 8마디 viewport는 유지하고 Arrangement +8 bars, zoom 및 horizontal scroll로 최대 32768마디를 편집합니다. offscreen clip과 파형 pixel은 cull합니다. 32트랙 색상은 기존 8색 palette를 반복합니다.
 
 Instrument 제목으로 Synth/Sampler/Drum을 바꾸며 source/waveform, sampler root, envelope, 16 drum key의 sample을 선택합니다. 같은 Devices 카드에서 EQ/Compressor/Delay, 같은 Mixer strip에서 pan/output/send와 추가 bus를 조작합니다.
 
 Record arm과 상단 Record/R, Shift+R MIDI take, Stop, input monitor가 실제 controller callback에 연결됩니다. 녹음 중 문서 편집은 잠시 막고 stop/record는 계속 동작합니다. 파일/입력 장치 실패를 상태에 표시합니다. Ctrl+, popup의 Input/MIDI에서 8개씩 페이지를 넘겨 포트를 선택하며 MIDI drop 수를 표시합니다. 녹음 중 파일 drop도 거절합니다. 입력에는 native OS save dialog를 take 경로에 사용합니다. `.partial.wav` 자동 복구 및 별도 take editor는 미구현입니다.
+
+## 녹음 안정성과 지연 보정 컨트롤
+
+Studio 04의 palette·패널 배치·OS 기본 창을 그대로 유지합니다. 기존 Devices의 Compressor/Delay 카드 안에 Lookahead 0/2/5/10 ms 선택을 연결합니다. Ctrl+, → Input popup에는 Estimated/Manual only, 추가 offset ±1 ms/reset, input 추정/PDC samples, 녹음 queue peak/lost를 표시합니다. 실장치 loopback 자동 측정을 하지 않았음을 표시합니다. 녹음 중 편집은 잠그되 진단 popup과 뷰 전환/Stop은 계속 접근할 수 있습니다.
+
+playhead는 graph 처리 지연을 반영합니다. 초기 viewport와 기본 5트랙/8마디는 바꾸지 않습니다. 긴 녹음은 current visible end에 멈추지 않고, 완료된 take를 가져오면 timeline을 확장합니다. 파일 writer의 실패·불명확한 입력 gap은 즉시 중단하여 partial을 보존합니다. 자동 복구 UI는 없고 CLI로 새 파일을 복구합니다.

@@ -11,6 +11,7 @@ bool validStrip(const Strip &s, int firstBus) noexcept {
     return range(s.pan, -1, 1) && range(s.lowDb, -24, 24) && range(s.midDb, -24, 24) &&
            range(s.highDb, -24, 24) && range(s.thresholdDb, -60, 0) && range(s.ratio, 1, 20) &&
            range(s.delayWet, 0, 1) && range(s.delaySeconds, .01f, 1) && range(s.feedback, 0, .9f) &&
+           s.lookaheadFrames <= Strip::maxLookahead &&
            (s.route == -1 || (s.route >= firstBus && s.route < int(Plan::maxBuses))) &&
            std::all_of(s.sends.begin(), s.sends.end(), [&](float v) { return range(v, 0, 1); });
 }
@@ -30,7 +31,9 @@ Engine::Engine(uint32_t sampleRate, std::span<const float> stereoTexture) : samp
     monitor_ = std::make_unique<SpscQueue<std::array<float, 2>, 16384>>();
     for (auto &state : dsp_) {
         state.delay.resize(sampleRate_ + 1);
+        state.lookahead.resize(Strip::maxLookahead + 1);
     }
+    alignmentStorage_.resize(alignment_.size() * (maxCompensation + 1));
     coefficients();
 }
 
@@ -56,6 +59,8 @@ std::span<const float> Engine::prepareSample(std::shared_ptr<const std::vector<f
 
 bool Engine::submit(const Plan &plan) noexcept {
     if (!plan.loopFrames || plan.count > Plan::capacity || plan.sampleCount > Plan::sampleCapacity ||
+        !std::isfinite(plan.clickIntervalFrames) || plan.clickIntervalFrames < 0 ||
+        (plan.clickIntervalFrames > 0 && plan.clickIntervalFrames < 1) ||
         plan.clickCount > plan.clicks.size() || plan.loopEndFrame > plan.loopFrames ||
         !std::isfinite(plan.masterGain) || plan.masterGain < 0 || plan.masterGain > 1) {
         return false;
@@ -178,6 +183,9 @@ SampleStream *Engine::prepareStream(std::shared_ptr<SampleStream> stream) {
     if (!stream) {
         return nullptr;
     }
+    if (!stream->frames()) {
+        throw std::runtime_error("Stream has no output frames");
+    }
     for (const auto &existing : streams_) {
         if (existing == stream) {
             return existing.get();
@@ -256,7 +264,91 @@ std::array<float, 2> Engine::readSource(uint32_t source, uint64_t frame, bool lo
     const auto at = size_t(frame % (buffer.size() / 2)) * 2;
     return {buffer[at], buffer[at + 1]};
 }
+namespace {
+struct Arrival {
+    std::array<uint32_t, Plan::maxTracks> tracks{};
+    std::array<uint32_t, Plan::maxBuses> inputs{}, buses{};
+    uint32_t master = 0;
+};
+Arrival arrivals(const Plan &plan) noexcept {
+    Arrival a;
+    for (size_t track = 0; track < Plan::maxTracks; ++track) {
+        a.tracks[track] = plan.strips[track].lookaheadFrames;
+        const auto &strip = plan.strips[track];
+        if (strip.route < 0) {
+            a.master = std::max(a.master, a.tracks[track]);
+        } else {
+            auto &input = a.inputs[size_t(strip.route)];
+            input = std::max(input, a.tracks[track]);
+        }
+        for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
+            if (strip.sends[bus] > 0) {
+                a.inputs[bus] = std::max(a.inputs[bus], a.tracks[track]);
+            }
+        }
+    }
+    for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
+        a.buses[bus] = a.inputs[bus] + plan.buses[bus].lookaheadFrames;
+        const int route = plan.buses[bus].route;
+        if (route < 0) {
+            a.master = std::max(a.master, a.buses[bus]);
+        } else {
+            auto &input = a.inputs[size_t(route)];
+            input = std::max(input, a.buses[bus]);
+        }
+    }
+    return a;
+}
+} // namespace
+uint32_t planLatencyFrames(const Plan &plan) noexcept {
+    if (!validStrip(plan.master, int(Plan::maxBuses))) {
+        return 0;
+    }
+    for (const auto &strip : plan.strips) {
+        if (!validStrip(strip)) {
+            return 0;
+        }
+    }
+    for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
+        if (!validStrip(plan.buses[bus], int(bus + 1))) {
+            return 0;
+        }
+    }
+    return arrivals(plan).master + plan.master.lookaheadFrames;
+}
+void Engine::prepareAlignment() noexcept {
+    const auto a = arrivals(*plan_);
+    for (size_t node = 0; node < nodes; ++node) {
+        const uint32_t source = node < Plan::maxTracks                    ? a.tracks[node]
+                                : node < Plan::maxTracks + Plan::maxBuses ? a.buses[node - Plan::maxTracks]
+                                                                          : 0;
+        for (size_t dest = 0; dest < destinations; ++dest) {
+            const auto target = dest < Plan::maxBuses ? a.inputs[dest] : a.master;
+            auto &state = alignment_[node * destinations + dest];
+            // Unconnected edges may have negative differences; they are never consumed.
+            state.frames = target > source ? target - source : 0;
+        }
+    }
+    graphLatency_.store(a.master + plan_->master.lookaheadFrames);
+}
+std::array<float, 2> Engine::align(std::array<float, 2> signal, size_t source, size_t dest) noexcept {
+    const size_t index = source * destinations + dest;
+    auto &state = alignment_[index];
+    if (!state.frames) {
+        return signal;
+    }
+    const auto size = size_t(state.frames) + 1;
+    const size_t base = index * (maxCompensation + 1);
+    auto output = state.valid >= state.frames
+                      ? alignmentStorage_[base + (state.cursor + size - state.frames) % size]
+                      : std::array<float, 2>{};
+    alignmentStorage_[base + state.cursor] = signal;
+    state.cursor = (state.cursor + 1) % size;
+    state.valid = std::min(state.valid + 1, size);
+    return output;
+}
 void Engine::coefficients() noexcept {
+    prepareAlignment();
     for (size_t i = 0; i < dsp_.size(); ++i) {
         const auto &s = i < Plan::maxTracks                    ? plan_->strips[i]
                         : i < Plan::maxTracks + Plan::maxBuses ? plan_->buses[i - Plan::maxTracks]
@@ -272,6 +364,10 @@ void Engine::resetDsp() noexcept {
         state.low = state.high = {};
         state.envelope = 0;
         state.cursor = state.delayValid = 0;
+        state.lookaheadCursor = state.lookaheadValid = 0;
+    }
+    for (auto &state : alignment_) {
+        state.cursor = state.valid = 0;
     }
 }
 
@@ -289,16 +385,27 @@ std::array<float, 2> Engine::processStrip(std::array<float, 2> signal, const Str
                          (signal[ch] - state.high[ch]) * highGain_[index];
         }
     }
+    float compression = 1;
     if (s.thresholdDb < 0) {
         float peak = std::max(std::abs(signal[0]), std::abs(signal[1]));
         const float alpha = peak > state.envelope ? .02f : .0002f;
         state.envelope += alpha * (peak - state.envelope);
         if (state.envelope > thresholds_[index]) {
-            const float gain = std::pow(thresholds_[index] / state.envelope, 1 - 1 / s.ratio);
-            signal[0] *= gain;
-            signal[1] *= gain;
+            compression = std::pow(thresholds_[index] / state.envelope, 1 - 1 / s.ratio);
         }
     }
+    if (s.lookaheadFrames) {
+        const auto size = size_t(s.lookaheadFrames) + 1;
+        auto delayed = state.lookaheadValid >= s.lookaheadFrames
+                           ? state.lookahead[(state.lookaheadCursor + size - s.lookaheadFrames) % size]
+                           : std::array<float, 2>{};
+        state.lookahead[state.lookaheadCursor] = signal;
+        state.lookaheadCursor = (state.lookaheadCursor + 1) % size;
+        state.lookaheadValid = std::min(state.lookaheadValid + 1, size);
+        signal = delayed;
+    }
+    signal[0] *= compression;
+    signal[1] *= compression;
     if (s.delayWet > 0) {
         size_t distance = std::clamp(size_t(s.delaySeconds * sampleRate_), size_t(1), state.delay.size() - 1);
         auto echo = state.delayValid >= distance
@@ -326,6 +433,7 @@ void Engine::process(std::span<float> out) noexcept {
         voices_.fill({});
         clickRemaining_ = 0;
         coefficients();
+        resetDsp();
         frame_ %= plan_->loopFrames;
     }
     if (reset_.exchange(false)) {
@@ -446,16 +554,27 @@ void Engine::process(std::span<float> out) noexcept {
                     trackSample[event.track][1] += signal[1];
                 }
             }
-            if (click && std::binary_search(plan_->clicks.begin(), plan_->clicks.begin() + plan_->clickCount,
-                                            frame_)) {
+            const bool beatClick =
+                plan_->clickIntervalFrames > 0
+                    ? frame_ ==
+                          uint64_t(std::llround(std::round(double(frame_) / plan_->clickIntervalFrames) *
+                                                plan_->clickIntervalFrames))
+                    : std::binary_search(plan_->clicks.begin(), plan_->clicks.begin() + plan_->clickCount,
+                                         frame_);
+            if (click && beatClick) {
                 clickRemaining_ = 960;
             }
         }
         if (clickRemaining_ && run && click) {
             float s = float(std::sin(double(clickRemaining_) * .18)) * .12f * float(clickRemaining_) / 960;
-            left += s;
-            right += s;
+            auto signal = align({s, s}, nodes - 1, Plan::maxBuses);
+            left += signal[0];
+            right += signal[1];
             --clickRemaining_;
+        } else {
+            auto signal = align({}, nodes - 1, Plan::maxBuses);
+            left += signal[0];
+            right += signal[1];
         }
         std::array<float, 2> input{};
         if (monitor_->pop(input)) {
@@ -466,7 +585,8 @@ void Engine::process(std::span<float> out) noexcept {
             }
         }
         std::array<std::array<float, 2>, Plan::maxBuses> busSample{};
-        auto route = [&](const std::array<float, 2> &signal, int target) {
+        auto route = [&](const std::array<float, 2> &raw, int target, size_t source) {
+            const auto signal = align(raw, source, target < 0 ? Plan::maxBuses : size_t(target));
             if (target < 0) {
                 left += signal[0];
                 right += signal[1];
@@ -483,11 +603,18 @@ void Engine::process(std::span<float> out) noexcept {
                 trackStereoPeaks[track][channel] = std::max(trackStereoPeaks[track][channel], magnitude);
                 trackPeaks[track] = std::max(trackPeaks[track], magnitude);
             }
-            route(signal, plan_->strips[track].route);
+            auto mainSignal = signal;
+            const int target = plan_->strips[track].route;
+            if (target >= 0) {
+                mainSignal[0] *= 1 + plan_->strips[track].sends[size_t(target)];
+                mainSignal[1] *= 1 + plan_->strips[track].sends[size_t(target)];
+            }
+            route(mainSignal, target, track);
             for (size_t bus = 0; bus < Plan::maxBuses; ++bus) {
-                if (plan_->strips[track].sends[bus] != 0) {
-                    busSample[bus][0] += signal[0] * plan_->strips[track].sends[bus];
-                    busSample[bus][1] += signal[1] * plan_->strips[track].sends[bus];
+                if (plan_->strips[track].sends[bus] != 0 && int(bus) != target) {
+                    auto sent = align(signal, track, bus);
+                    busSample[bus][0] += sent[0] * plan_->strips[track].sends[bus];
+                    busSample[bus][1] += sent[1] * plan_->strips[track].sends[bus];
                 }
             }
         }
@@ -496,7 +623,7 @@ void Engine::process(std::span<float> out) noexcept {
             auto signal = processStrip(busSample[bus], plan_->buses[bus], Plan::maxTracks + bus);
             signal[0] *= plan_->busGains[bus];
             signal[1] *= plan_->busGains[bus];
-            route(signal, plan_->buses[bus].route);
+            route(signal, plan_->buses[bus].route, Plan::maxTracks + bus);
         }
         auto master = processStrip({left, right}, plan_->master, Plan::maxTracks + Plan::maxBuses);
         left = master[0];

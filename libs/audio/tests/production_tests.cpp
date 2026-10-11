@@ -122,6 +122,44 @@ int main() {
         engine.process(out);
         CHECK(out[200] > 0 && out[260] == 0); // Octave plays at twice the rate.
     }
+    {
+        Engine engine(8000);
+        auto plan = std::make_unique<Plan>();
+        plan->loopFrames = 2048;
+        plan->gains.fill(0);
+        plan->gains[0] = plan->gains[1] = 1;
+        plan->sourcesBound = true;
+        auto sample = std::make_shared<const std::vector<float>>(std::vector<float>{.1f, .1f});
+        plan->sources[0] = engine.prepareSample(sample);
+        plan->sampleCount = 2;
+        plan->samples[0] = {0, 1, 0, 0, 0, false};
+        plan->samples[1] = {0, 1, 1, 0, 0, false};
+        plan->strips[0].lookaheadFrames = 32;
+        plan->strips[0].route = 0;
+        plan->strips[0].sends[0] = .5f;  // Same bus uses exactly one delay line.
+        plan->strips[1].sends[1] = .25f; // Parallel paths reconverge at bus 1 and master.
+        plan->buses[0].lookaheadFrames = 64;
+        plan->buses[0].route = 1;
+        plan->buses[1].lookaheadFrames = 16;
+        plan->master.lookaheadFrames = 8;
+        CHECK(planLatencyFrames(*plan) == 120);
+        CHECK(engine.submit(*plan));
+        engine.play(true);
+        std::array<float, 1024> output{};
+        engine.process(output);
+        CHECK(engine.latencyFrames() == 120);
+        for (size_t frame = 0; frame < output.size() / 2; ++frame) {
+            CHECK(std::abs(output[frame * 2] - (frame == 120 ? .275f : 0)) < 1e-6f);
+            CHECK(output[frame * 2] == output[frame * 2 + 1]);
+        }
+        engine.rewind();
+        engine.process(std::span(output).first(40));
+        engine.seek(1000);
+        engine.process(output);
+        CHECK(std::all_of(output.begin(), output.end(), [](float v) { return v == 0; }));
+        plan->strips[0].lookaheadFrames = Strip::maxLookahead + 1;
+        CHECK(!engine.submit(*plan));
+    }
     std::cout << "Prepared graph routing/sends, EQ, compressor, delay, pan, timed MIDI, sampler and drum "
                  "one-shots passed\n";
 }

@@ -1,86 +1,53 @@
-# Ally 제작 기능 검증 기록
+# Ally 녹음·스트리밍·지연 보정 검증
 
-검증 날짜: 2026-10-11 (Asia/Seoul). Linux 실행과 native SDK CI를 구분합니다. 전체 전문 DAW 완성이나 장시간 안정성 검증을 의미하지 않습니다.
+2026-10-11 (Asia/Seoul). 이번 검사는 구현된 경로와 관측한 부하를 검증하며 수시간 무손실, 모든 장치/플러그인 또는 물리 왕복 지연의 정확도를 보증하지 않습니다.
 
 ## 환경과 디자인
 
-Fedora Linux x86-64, Clang 21.1.8, GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL3 3.2.24, Skia chrome/m124 고정 소스, libremidi 4.5.0, libsoxr 0.1.3. 실제 GPU는 NVIDIA GeForce RTX 2060입니다. 자체 ALSA input/output의 48 kHz float 경로를 사용했습니다.
+Fedora Linux x86-64, Clang 21.1.8 / GCC 15.3.1, CMake 3.31.11, Python 3.14.7, SDL3 3.2.24, Skia m124 고정 소스, libremidi 4.5.0, libsoxr 0.1.3, NVIDIA RTX 2060. ALSA/PipeWire 입력 `pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo`, ALSA default output, 48 kHz / 256 requested frames를 사용했습니다.
 
-사용자 제공 Studio 04 HTML은 수정하지 않았습니다. SHA-256은 `d9a81429bbb5c18dcee5d0cb71c6957241c65cbad2e862cf53858d169236d664`입니다. HTML은 시각적 명세이며 앱은 SDL3/Skia 네이티브입니다. 원본 HTML과 pixel diff는 수행하지 않았습니다. palette·기본 panel 배치/치수를 유지하며 기존 control에 실제 기능을 연결했습니다. `images/workspace.png`, `devices.png`, `mixer.png`는 이번 Release 앱의 실제 GPU surface 캡처입니다.
+Studio 04 원본 HTML의 SHA-256은 `d9a81429bbb5c18dcee5d0cb71c6957241c65cbad2e862cf53858d169236d664`로 그대로입니다. 기본 palette·패널 배치·치수와 초기 5트랙/8마디를 유지합니다. SDL3/Skia 직접 그리기이며 HTML runtime과 자체 OS caption/control이 없습니다. 실제 X11 창은 OS title bar 37px를 반환했습니다. GPU surface 캡처에는 OS 장식이 포함되지 않습니다. HTML과 pixel diff는 수행하지 않았습니다.
 
-네이티브 X11/XWayland에서 SDL_GetWindowBordersSize가 OS title bar 37px를 반환했습니다. 앱 내부 minimize/maximize/close 버튼 및 borderless/caption은 없습니다. OS close-request 경로를 GUI smoke로 확인했습니다. GPU framebuffer 캡처는 OS 제목 표시줄을 포함하지 않습니다.
-
-## Linux 최종 결과
+## 로컬 빌드와 실행
 
 | 검사 | 결과 |
 |---|---|
-| Debug / Release 전체 빌드 | 성공, 자체 소스 warning/error 없음 |
-| Debug CTest | 8/8 통과, 12.51초 |
-| Release CTest | 8/8 통과, 1.02초 |
-| ASan / UBSan / LeakSanitizer | 8/8 통과, 37.51초, 샌드박스 밖 실행 |
-| 독립 Audio GCC Release / CTest | 성공, 4/4 통과 |
-| 독립 Media GCC Release / CTest | 성공, 1/1 통과 |
-| Release GUI smoke 1440×900 / 870×650 | 실제 NVIDIA GL, 두 크기 교대로 10/10 통과. Debug 870×650도 통과 |
-| 실제 native audio record→WAV→track clip | 29,440프레임, 녹음 큐 손실 0, 48 kHz stereo WAV 검사 통과 |
-| 녹음 probe 중 출력 | 85,248프레임 처리, buffer 256, xrun 0, 최대 process 0.217461 ms |
-| Mixer 실제 재생 | peak 0.265195, 173,056프레임 처리, xrun 0, 최대 process 0.313373 ms |
-| OS 기본 창 | X11 title bar 37px, close-request smoke 통과 |
-| clang-format / git diff whitespace | 통과 |
-| 설치 SDK 소비자 | 외부 CMake에서 Audio/Resampler/Media·PipeWire dependency 해결 및 PCM 변환 검사 통과 |
-| CPack Linux ZIP | 생성·압축 해제 후 실행 권한, 디자인/캡처 일치·GUI smoke·743,226프레임 WAV export/inspect 통과 |
+| Debug / Release 전체 빌드 | 성공 |
+| Debug / Release CTest | 각각 11/11 통과 |
+| ASan / UBSan / LeakSanitizer | 11/11 통과, 누수 검사 포함 샌드박스 밖 실행 |
+| 독립 Audio + HQ resampler, GCC Release | 5/5 통과, 로컬 고정 libsoxr 소스 사용 |
+| 독립 Media, GCC Release | 2/2 통과 |
+| 설치 SDK 외부 소비자 | Audio/Media/StreamingResampler/PDC 링크·실행 통과 |
+| MinGW Windows 교차 빌드 | native WASAPI capture와 Audio 타깃 컴파일/링크 성공; 실행하지 않음 |
+| 실제 NVIDIA GUI smoke | 1440×900 / 870×650에서 기존 편집·새 보정/룩어헤드·SDL Space·OS close-request 통과 |
+| format / whitespace / doctor | 통과 |
 
-위 최대 처리 시간은 해당 짧은 실행에서 관측한 값이며 최악 부하 보증이 아닙니다. output latency 21.3333 ms는 backend 추정값으로, physical loopback으로 측정한 round-trip latency가 아닙니다. 입력 장치는 `pipewire:NODE=alsa_input.pci-0000_0b_00.3.analog-stereo`이며 실제 PipeWire Audio/Source discovery와 ALSA PipeWire PCM으로 열었습니다. 연결된 외부 마이크의 음질이나 audible loopback은 검증하지 않았습니다.
+libsoxr upstream의 C dispatch에는 기존 Clang function-type instrumentation 제외만 유지하고 다른 sanitizer와 Ally 소스의 검사는 활성화했습니다. 독립 resampler 구성은 CMake의 `FETCHCONTENT_SOURCE_DIR_SOXR_SOURCE`로 같은 공개 0.1.3 소스를 지정해 오프라인 검증했습니다.
 
-## 검사한 동작
+## 실제 녹음과 고장 복구
 
-- Editing: 노트/클립 다중 선택, 그룹 clamp/이동/resize, clipboard·duplicate·삭제, cross-track 패턴 복제, editor 전환 뒤 clipboard와 새 문서로 패턴/오디오 소스 붙여넣기, stale selection 거절, 한 번의 Undo, timeline 확장·줌/스크롤, 16트랙 문서 검사.
-- Instruments/MIDI: instrument/drum map·FX v6 저장/복원, sampler octave 재생, drum one-shot, 블록 안 128번째 샘플 MIDI 시작, clock 증가, 4-beat 경계 MIDI take 분할.
-- Audio/Media: 약 45.8초 WAV를 작은 block으로 생성·읽기, stream cache 경계 4095/4096, 전체 PCM 없이 소스 준비/문서 복원·trim export, 손상 파일 거절. capture→fixed SPSC→동시 left/right/stereo 3개 WAV 내용·길이 검사.
-- DSP: pan/bus gain/send의 정확한 샘플 값, low EQ·compressor 감쇠, 80샘플 delay 위치, seek/rewind tail 초기화, cyclic bus route 거절.
-- RT: Engine::process 기존 heap 금지 검사와 실제 DiskStream::read/Recorder::capture에 operator new를 금지한 검사를 통과. 디스크 worker의 비실시간 할당은 허용합니다.
-- 기존 회귀: pattern 독립성·문서 이전 버전 변환, WAV sample-rate 변환·source offset/loop/relink/누락, atomic 파일 교체·실패 후 원본 보존, recovery/lease, MIDI 파서와 SPSC, C ABI, malformed RIFF 입력.
-- GUI: 실제 hit target으로 기존 편집/파일 worker 외에도 그룹 selection/clipboard·+8 bars·악기 전환·EQ/bus delay·Arm·MIDI take를 검사. 파일 선택 결과와 MIDI 이벤트는 fixture로 주입하며 OS 파일 선택기의 사람 조작이나 실제 MIDI 장치 검증으로 해석하지 않습니다.
+- 실제 HDD(`/mnt/hdd/ally/build/soak`)에 stereo/left/right 3트랙을 두 번 각각 300초 연속 기록했습니다. 첫 run 14,399,232 frames, 두 번째 run 14,398,464 frames. 두 run 모두 queue lost 0 / output XRUN 0이며 세 파일의 길이와 마지막 frame 읽기가 일치했습니다. 자동 fixture는 검사 후 제거했습니다.
+- 두 번째 run은 GUI·build/test 부하와 함께 진행했습니다. queue peak 25,088 frames; 최대 관측 output process wall time 6.19828 ms. 이는 256-frame period(5.333 ms)보다 큽니다. 해당 버퍼링에서 XRUN은 없었지만 모든 부하에서 deadline을 지킨다는 근거로 해석하지 않습니다. RT thread scheduling·callback Linux backend와 더 긴 부하 검사가 다음 단계입니다.
+- GUI에서 65초를 지정한 native record/import probe: 3,167,488 capture frames, lost 0, queue peak 37,888. current 32-beat timeline을 넘겨 계속 기록하고 긴 stream WAV를 Arrangement에 가져왔습니다. 보정 시작은 -0.0882208 beat이며 음수 구간을 source offset으로 제외했습니다. output XRUN 0, 최대 process 1.48997 ms. 진단용 UI timer의 요청 시간과 정확한 PCM frame 길이를 구분합니다.
+- 8트랙 가속 과부하: 각 2,560,000 frames 파일, 2,273,536 lost frames, queue peak 261,888. 모든 파일의 실제 무음 frame 수가 loss counter와 같았고 마지막 손실까지 길이를 보존했습니다. 이는 53.3초 상당의 입력을 빠르게 투입한 고의 과부하 검사이며 실시간 53.3초 녹음이 아닙니다.
+- 새 native GUI 녹음 프로세스만 강제 종료한 뒤 CLI로 실제 partial을 복구했습니다. 49,152 complete frames를 읽고 원본 partial의 SHA-256 불변을 확인했습니다. 합성 fixture도 checkpoint 이후 PCM, incomplete final frame, 기존 목적지 거절을 검사합니다.
+- RF64 전체 쓰기: sparse shortcut 없이 536,936,447 stereo frames / 4,295,491,656 bytes를 기록했습니다. RIFF→RF64 전환과 ds64 크기, 끝 sample .125 읽기가 통과했습니다. 이 경계 fixture는 `/tmp`의 tmpfs에 기록했으며 실제 녹음 soak는 HDD였습니다.
 
-## 플랫폼·패키지 검증
+실제 입력 데이터와 모듈 경로를 검증했지만 외부 마이크 음질과 physical loopback은 측정하지 않았습니다. 전체 6시간 take/32트랙 hardware soak·정전·디스크 공간 소진 검사는 수행하지 않았습니다.
 
-최종 구현 커밋 `7a25e50`의 [native SDK CI](https://github.com/wavefnd-labs/ally/actions/runs/38111600208)는 네 작업 모두 성공했습니다. Ubuntu 24.04·Windows Server 2022/MSVC·macOS 14 각각 코어 8/8·독립 Audio 4/4·Media 1/1을 통과했고 Linux sanitizer도 8/8을 통과했습니다. Windows/MSVC와 Apple SDK 빌드 및 모든 코어 회귀 검사를 통과했습니다. Windows production의 파일 핸들 정리와 프로젝트 테스트의 큰 Plan 스택 문제를 수정한 뒤 재검증한 결과입니다. MSVC는 false sharing 방지 `alignas(64)`의 의도된 padding에 C4324 경고를 보고하며, 다른 자체 소스 경고는 확인되지 않았습니다.
+## HQ 변환과 지연 검사
 
-WASAPI capture를 포함한 MinGW 독립 오디오 크로스 빌드/링크는 통과했습니다. Windows 실행, Apple HAL 실제 하드웨어와 SDL3/Skia 전체 GUI는 해당 OS에서 아직 검증하지 않았습니다. CI의 native backend 검사는 실제 SDK 빌드와 장치 없는 invalid-config/stop 계약을 검사하며 physical I/O를 대신하지 않습니다.
+- 상태형 StreamingResampler의 작은 input/output chunks, EOF drain, reset: 8/44.1/48/96/192/384 kHz→48 kHz에서 전체 libsoxr HQ 기준과 frame count·sample을 비교했습니다.
+- 실제 DiskStream의 비순차 seek/cache boundary/EOF, 8/44.1/96/384/44.101 kHz. 44.101 kHz에서는 rational phase 주기 이후 먼 탐색도 검사했습니다. 전체 HQ 기준 대비 최대 sample 차이 4.54485e-7; 96 kHz source에는 32 kHz stopband tone을 사용했습니다.
+- 연속 HQ의 96→48 kHz, 32 kHz tone interior RMS 2.82364e-8. stopband suppression을 실제 출력으로 검사했습니다.
+- track/direct/send/연쇄 bus/master를 통과하는 impulse를 120번째 frame 하나로 합쳤으며 동일 bus route+send의 중복 delay 진행을 검사했습니다. seek/rewind 후 이전 delay tail이 사라지고 invalid latency를 거절합니다.
+- offline export는 시작 padding을 제거하고 원래 첫 sample과 timeline frame count를 유지했습니다. 입력 packet/clock·추정 native input/output·PDC·manual offset의 위치 계산, v6→v7와 새 설정 저장/복원을 검사했습니다.
+- Engine::process의 새 룩어헤드/PDC/seek 경로와 기존 DiskStream::read/Recorder::capture에서 operator new 금지 검사를 통과했습니다. worker 할당은 비실시간입니다.
 
-libsoxr 0.1.3 generic C dispatch의 Clang function-pointer 타입 검사만 해당 타깃에서 제외했습니다. ASan/나머지 UBSan 및 Ally 코드는 유지합니다. 샌드박스 ptrace 제한 때문에 LeakSanitizer는 제한 밖에서 실행했습니다.
+## 데스크톱 CI와 패키지
 
-## 발견한 문제와 한계
+현재 변경의 Linux/Windows/macOS native core 및 sanitizer CI 결과, 최종 ZIP 검증은 아래에 완료 후 기록합니다. 전체 Windows/macOS SDL3/Skia GUI·실장치 I/O 검증은 포함하지 않습니다.
 
-- 입력 시작 실패 후 0프레임 WAV가 남아 같은 위치의 재녹음을 막던 문제를 수정했습니다. 존재하지 않는 장치로 실패한 뒤 같은 경로에서 실제 입력으로 29,696프레임을 녹음/import한 검사를 통과했습니다(큐 손실 0, 출력 xrun 0).
-- 마지막 package smoke에서 키보드 검증이 한 번 실패했습니다. window ID/scancode/down이 완전한 SDL 이벤트를 주입하고 고정 frame의 재생 여부 대신 실제 event dispatch 직후 transport 변화로 검증하도록 수정했습니다. 두 창 크기의 Release GPU smoke를 교대로 10회 실행해 모두 통과했고 Debug도 통과했습니다.
-- Windows production 테스트는 스트림 핸들을 해제한 뒤 파일을 정리하도록 수정했습니다. 프로젝트 회귀 테스트의 여러 큰 Plan이 Windows 기본 스택에 쌓여 segmentation fault가 발생한 문제도 helper/heap 보관으로 수정했습니다. MinGW -O0 stack-usage에서 main frame은 839,984→18,944 bytes로 줄었습니다.
-- 기본 Linux capture PCM이 ENOENT로 열리지 않는 환경에서 실제 PipeWire source를 열거해 명시적으로 선택하도록 연결했습니다. 직접 PipeWire/JACK callback backend는 아직 없습니다.
-- stream worker가 이미 준비된 슬롯을 반복해서 writing으로 전환하여 RT miss를 만들던 문제를 수정했습니다. seek·동시 먼 offset·디스크 지연에서 miss가 날 수 있으며 miss 프레임 수를 표시하고 무음으로 처리합니다.
-- 긴 WAV sample-rate 변환은 선형 보간입니다. libsoxr continuous HQ streaming·진행/취소·정밀 캐시 scheduling은 다음 작업입니다.
-- 녹음 queue overflow는 길이를 보존한 무음으로 채우고 lost 수를 보고합니다. native capture discontinuity의 정확한 손실 길이·input/output drift·round-trip 보정은 미구현입니다. partial WAV는 1초마다 header를 갱신하며 자동 recovery UI는 없습니다.
-- `/dev/snd/seq` 및 MIDI 입력 포트가 없어 실제 MIDI 장비·hotplug는 검증하지 못했습니다. OS MIDI timestamp 보정과 MPE/UMP/MIDI 2.0/CC automation도 다음 단계입니다.
-- macOS capture 장치는 현재 48 kHz로 구성해야 합니다. 다른 sample rate에서는 명확한 오류를 반환합니다.
-- 기본 DSP는 tone EQ/peak compressor/delay입니다. parametric EQ·sidechain·reverb·generic node graph·latency compensation·plan/voice crossfade·플러그인·RF64/AIFF·clip launcher·time-stretch는 미구현입니다.
-- Windows/macOS 전체 GUI와 실제 input/output, 장시간 부하, 다중 모니터 DPI·다른 글꼴 metrics·OS dialog 사람 조작은 별도 검증 대상입니다. 라이선스는 미정이며 모바일/Web/BSD는 제외합니다.
+## 남은 한계
 
-## 재현
-
-```bash
-python3 x.py build
-python3 x.py build --release
-ctest --preset debug
-ctest --preset release
-cmake --preset asan
-cmake --build --preset asan
-ctest --preset asan
-python3 x.py fmt --check
-./build/release/ally --smoke
-./build/release/ally --smoke --window-size 870 650
-./build/release/ally --view mixer --play --frames 210 --screenshot /tmp/mixer.bmp
-./build/release/ally --record-probe /tmp/take.wav \
-  --input-device 'pipewire:NODE=your-input-node' --frames 90
-./build/release/ally --inspect /tmp/take-track1.wav
-python3 x.py package --release
-```
-
-녹음 probe는 실제 입력 장치를 열고 지정한 경로에 WAV를 만듭니다. 해당 파일은 덮어쓰지 않으며 재실행에는 새로운 경로가 필요합니다.
+물리 loopback 자동 측정, 장치별 calibration, 입력/출력 clock drift, OS MIDI timestamp 정렬, 외부 플러그인의 동적 latency는 남아 있습니다. 추정/수동 녹음 위치 보정과 내부 graph PDC의 범위를 구분합니다. plan 교체는 DSP history를 reset하며 무클릭 crossfade는 미구현입니다. 먼 여러 stream offset의 cache 충돌, 여러 트랙 finalize transaction과 자동 partial 복구 UI도 다음 단계입니다.

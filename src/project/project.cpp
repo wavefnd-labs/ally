@@ -203,12 +203,12 @@ Project Project::demo() {
     return p;
 }
 bool Project::valid() const noexcept {
-    if (!std::isfinite(bpm) || bpm < 20 || bpm > 300 || tracks.empty() ||
-        tracks.size() > audio::Plan::maxTracks || !std::isfinite(timelineBeats) || timelineBeats < 4 ||
-        timelineBeats > maxTimeline || !std::isfinite(loopBeats) || loopBeats < 4 ||
-        loopBeats > timelineBeats || !audio::validStrip(masterStrip, int(audio::Plan::maxBuses)) ||
-        !std::isfinite(masterGain) || masterGain < 0 || masterGain > 1 ||
-        sources.size() > audio::Plan::sourceCapacity) {
+    if (recordOffsetFrames < -48000 || recordOffsetFrames > 48000 || !std::isfinite(bpm) || bpm < 20 ||
+        bpm > 300 || tracks.empty() || tracks.size() > audio::Plan::maxTracks ||
+        !std::isfinite(timelineBeats) || timelineBeats < 4 || timelineBeats > maxTimeline ||
+        !std::isfinite(loopBeats) || loopBeats < 4 || loopBeats > timelineBeats ||
+        !audio::validStrip(masterStrip, int(audio::Plan::maxBuses)) || !std::isfinite(masterGain) ||
+        masterGain < 0 || masterGain > 1 || sources.size() > audio::Plan::sourceCapacity) {
         return false;
     }
     for (size_t i = 0; i < buses.size(); ++i) {
@@ -319,9 +319,7 @@ audio::Plan Project::compile(uint32_t rate) const {
     plan.buses = buses;
     plan.busGains = busGains;
     plan.master = masterStrip;
-    for (int beat = 0; beat < (songMode ? timelineBeats : 4); ++beat) {
-        plan.clicks[plan.clickCount++] = uint64_t(std::llround(fpb * beat));
-    }
+    plan.clickIntervalFrames = fpb;
     const bool anySolo = std::any_of(tracks.begin(), tracks.end(), [](const Track &t) { return t.solo; });
     plan.gains.fill(0);
     for (size_t i = 0; i < tracks.size(); ++i) {
@@ -465,13 +463,16 @@ void writeStrip(std::ostream &out, const audio::Strip &s) {
     for (float send : s.sends) {
         out << ' ' << send;
     }
-    out << '\n';
+    out << ' ' << s.lookaheadFrames << '\n';
 }
-void readStrip(std::istream &in, audio::Strip &s) {
+void readStrip(std::istream &in, audio::Strip &s, int version) {
     in >> s.pan >> s.lowDb >> s.midDb >> s.highDb >> s.thresholdDb >> s.ratio >> s.delayWet >>
         s.delaySeconds >> s.feedback >> s.route;
     for (float &send : s.sends) {
         in >> send;
+    }
+    if (version >= 7) {
+        in >> s.lookaheadFrames;
     }
 }
 } // namespace
@@ -480,10 +481,11 @@ void Project::save(const std::filesystem::path &path) const {
         throw std::runtime_error("Cannot save invalid project");
     }
     std::ostringstream out;
-    out << std::setprecision(17) << "ALLY_PROJECT 6\n"
+    out << std::setprecision(17) << "ALLY_PROJECT 7\n"
         << songMode << ' ' << bpm << ' ' << tracks.size() << ' ' << masterGain << ' ' << masterMuted << ' '
         << loop << ' ' << metronome << ' ' << sources.size() << '\n';
     out << timelineBeats << ' ' << loopBeats << '\n';
+    out << automaticRecordLatency << ' ' << recordOffsetFrames << '\n';
     writeStrip(out, masterStrip);
     for (size_t i = 0; i < buses.size(); ++i) {
         out << busGains[i] << ' ';
@@ -540,7 +542,7 @@ Project Project::load(const std::filesystem::path &path) {
     std::string magic;
     int version = 0;
     in >> magic >> version;
-    if (!((magic == "ALLY_PROJECT" && version >= 2 && version <= 6) ||
+    if (!((magic == "ALLY_PROJECT" && version >= 2 && version <= 7) ||
           (magic == "DAW_PROJECT" && version == 1))) {
         throw std::runtime_error("Unsupported project version");
     }
@@ -560,10 +562,13 @@ Project Project::load(const std::filesystem::path &path) {
     }
     if (version >= 6) {
         in >> p.timelineBeats >> p.loopBeats;
-        readStrip(in, p.masterStrip);
+        if (version >= 7) {
+            in >> p.automaticRecordLatency >> p.recordOffsetFrames;
+        }
+        readStrip(in, p.masterStrip, version);
         for (size_t i = 0; i < p.buses.size(); ++i) {
             in >> p.busGains[i];
-            readStrip(in, p.buses[i]);
+            readStrip(in, p.buses[i], version);
         }
     }
     if (!in || !tracks || tracks > audio::Plan::maxTracks || sources > 32) {
@@ -617,7 +622,7 @@ Project Project::load(const std::filesystem::path &path) {
             for (auto &id : t.drumSources) {
                 in >> id;
             }
-            readStrip(in, t.strip);
+            readStrip(in, t.strip, version);
         }
         t.patterns.resize(patterns);
         for (auto &pattern : t.patterns) {
@@ -758,12 +763,15 @@ void renderProject(const Project &project, const std::filesystem::path &path) {
     try {
         media::WavWriter writer(temporary, 48000, 2);
         std::array<float, 512> block{};
-        for (uint64_t frame = 0; frame < plan.loopFrames; frame += 256) {
+        const uint64_t latency = audio::planLatencyFrames(plan);
+        for (uint64_t frame = 0; frame < plan.loopFrames + latency; frame += 256) {
             engine.prefetch(plan, frame, true);
-            auto output =
-                std::span(block).first(size_t(std::min<uint64_t>(256, plan.loopFrames - frame)) * 2);
+            auto output = std::span(block).first(
+                size_t(std::min<uint64_t>(256, plan.loopFrames + latency - frame)) * 2);
             engine.process(output);
-            writer.append(output);
+            const auto skip =
+                size_t(std::min<uint64_t>(output.size() / 2, latency > frame ? latency - frame : 0));
+            writer.append(output.subspan(skip * 2));
         }
         writer.finish();
         replaceFile(temporary, path);

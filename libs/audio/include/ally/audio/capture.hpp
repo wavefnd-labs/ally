@@ -10,6 +10,8 @@ struct CaptureConfig {
 class CaptureSink {
   public:
     virtual ~CaptureSink() = default;
+    // Exact missing device frames, or zero if the discontinuity length is unknown.
+    virtual void gap(uint64_t) noexcept {}
     virtual void capture(std::span<const float> interleaved, uint16_t channels) noexcept = 0;
 };
 class Capture {

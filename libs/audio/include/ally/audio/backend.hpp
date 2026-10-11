@@ -18,6 +18,7 @@ struct BackendStats {
     uint64_t processedFrames = 0, underruns = 0, maxProcessNs = 0;
     int64_t errorCode = 0;
     bool active = false;
+    double inputLatencyMs = 0; // Capture estimate; outputLatencyMs is zero for capture backends.
 };
 class Backend {
   public:

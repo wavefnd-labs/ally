@@ -3,6 +3,7 @@
 #include <ally/audio/backend.hpp>
 #include <ally/audio/capture.hpp>
 #include <ally/file.hpp>
+#include <ally/media/stream.hpp>
 #include <ally/media/wav.hpp>
 #include <ally/midi.hpp>
 #include <ally/project.hpp>
@@ -62,13 +63,23 @@ int main(int argc, char **argv) {
     try {
         bool smoke = false, offline = false, autoplay = false, listDevices = false, noRecovery = false;
         ally::audio::BackendConfig audioConfig;
+        int recordSeconds = 0;
         int frameLimit = 0, windowWidth = 1440, windowHeight = 900;
         std::string initialView = "piano";
-        std::string capture, render, projectPath, inspect, recordProbe, inputDevice;
+        std::string capture, render, projectPath, inspect, recordProbe, inputDevice, recoverInput,
+            recoverOutput;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--record-probe" && i + 1 < argc) {
+            if (arg == "--recover-recording" && i + 2 < argc) {
+                recoverInput = argv[++i];
+                recoverOutput = argv[++i];
+            } else if (arg == "--record-probe" && i + 1 < argc) {
                 recordProbe = argv[++i];
+            } else if (arg == "--record-seconds" && i + 1 < argc) {
+                recordSeconds = std::stoi(argv[++i]);
+                if (recordSeconds < 1 || recordSeconds > 3600) {
+                    throw std::runtime_error("Record probe duration must be 1..3600 seconds");
+                }
             } else if (arg == "--input-device" && i + 1 < argc) {
                 inputDevice = argv[++i];
             } else if (arg == "--list-devices") {
@@ -117,15 +128,30 @@ int main(int argc, char **argv) {
                        "    [--smoke] [--frames N] [--screenshot file.bmp] [--view "
                        "piano|devices|mixer]\n"
                        "    [--window-size width height] [--list-devices] [--device id] [--buffer frames] "
-                       "[--no-recovery] [--input-device id] [--record-probe take.wav --frames N]\n";
+                       "[--recover-recording partial.wav recovered.wav] [--no-recovery] [--input-device id] "
+                       "[--record-probe take.wav --frames N | --record-seconds N]\n";
                 return 0;
             } else {
                 throw std::runtime_error("Unknown or incomplete argument: " + arg);
             }
         }
+        if (!recordProbe.empty()) {
+            noRecovery = true; // Automated capture probes must not open another session's recovery dialog.
+        }
+        if (recordSeconds && recordProbe.empty()) {
+            throw std::runtime_error("--record-seconds requires --record-probe");
+        }
+        if (!recoverInput.empty()) {
+            std::cout << "Recovered "
+                      << ally::media::recoverRecording(ally::textPath(recoverInput),
+                                                       ally::textPath(recoverOutput))
+                      << " complete frames; source preserved\n";
+            return 0;
+        }
         if (!inspect.empty()) {
-            auto pcm = ally::media::readWav(inspect);
-            std::cout << pcm.sampleRate << " Hz / " << pcm.channels << " channels / " << pcm.frames()
+            ally::media::WavReader reader(ally::textPath(inspect));
+            const auto &pcm = reader.info();
+            std::cout << pcm.sampleRate << " Hz / " << pcm.channels << " channels / " << pcm.frames
                       << " frames\n";
             return 0;
         }
@@ -251,6 +277,9 @@ int main(int argc, char **argv) {
             workspace.inputDevices = input->devices(inputError);
         }
         double takeStartBeat = 0;
+        uint64_t takeStartFrame = 0, takeStartClock = 0;
+        uint32_t takeGraphLatency = 0;
+        double takeInputLatency = 0, takeOutputLatency = 0;
         if (!inputDevice.empty()) {
             workspace.inputConfig.deviceId = inputDevice;
         }
@@ -324,8 +353,16 @@ int main(int argc, char **argv) {
             recorder.monitor(workspace.monitoring ? workspace.selectedTrack() : -1,
                              workspace.selectedInputChannel());
             if (workspace.monitoring) {
+                takeStartFrame = engine.position();
+                takeStartClock = engine.timestamp();
+                takeGraphLatency = ally::audio::planLatencyFrames(project.compile(engine.sampleRate()));
+                takeOutputLatency = backend->stats().outputLatencyMs;
+                workspace.audioRecordingState(true);
+                engine.play(true);
                 std::string error;
                 if (!input->start(recorder, workspace.inputConfig, error)) {
+                    workspace.audioRecordingState(false);
+                    engine.play(false);
                     workspace.monitoring = false;
                     recorder.monitor(-1);
                     workspace.status = "Input unavailable: " + error;
@@ -354,10 +391,20 @@ int main(int argc, char **argv) {
         workspace.requestRecord = [&] {
             if (workspace.recordingAudio) {
                 input->stop();
-                workspace.recordingAudio = false;
+                workspace.audioRecordingState(false);
+                engine.play(false);
                 try {
                     auto files = recorder.finish();
                     engine.play(false);
+                    if (recorder.capturedFrames() && recorder.firstCaptureClock() != UINT64_MAX) {
+                        const auto start = ally::recordingStartFrame(
+                            takeStartFrame, takeStartClock, recorder.firstCaptureClock(),
+                            recorder.firstPacketFrames(), engine.sampleRate(), takeInputLatency,
+                            takeOutputLatency, takeGraphLatency, project.automaticRecordLatency,
+                            project.recordOffsetFrames);
+                        takeStartBeat = double(start - int64_t(recorder.firstPacketOffsetFrames())) /
+                                        (engine.sampleRate() * 60.0 / project.bpm);
+                    }
                     workspace.recorded(std::move(files), takeStartBeat, recorder.lostFrames());
                     if (recorder.lostFrames()) {
                         workspace.status = "Recording lost " + std::to_string(recorder.lostFrames()) +
@@ -400,7 +447,7 @@ int main(int argc, char **argv) {
                 if (routes.empty()) {
                     throw std::runtime_error("No armed recording tracks");
                 }
-                recorder.start(std::move(routes));
+                recorder.start(std::move(routes), false);
                 std::string error;
                 if (!input->start(recorder, workspace.inputConfig, error)) {
                     const auto unused = recorder.finish();
@@ -412,9 +459,14 @@ int main(int argc, char **argv) {
                     }
                     throw std::runtime_error("Native input failed: " + error);
                 }
-                takeStartBeat = double(engine.position()) / (engine.sampleRate() * 60 / project.bpm);
-                workspace.recordingAudio = true;
+                takeInputLatency = input->stats().inputLatencyMs;
+                takeOutputLatency = backend->stats().outputLatencyMs;
+                takeGraphLatency = ally::audio::planLatencyFrames(project.compile(engine.sampleRate()));
+                takeStartFrame = engine.position();
+                takeStartClock = engine.timestamp();
+                workspace.audioRecordingState(true);
                 engine.play(true);
+                recorder.beginCapture();
                 workspace.status = "Recording armed tracks";
             } catch (const std::exception &e) {
                 workspace.status = e.what();
@@ -423,6 +475,8 @@ int main(int argc, char **argv) {
         if (!project.sourceWarnings().empty()) {
             workspace.status = project.sourceWarnings();
         }
+        auto probeStarted = std::chrono::steady_clock::now();
+        bool probeStopped = false;
         ally::midi::Input midi(engine);
         workspace.midiStatus = offline ? "MIDI device probing disabled in offline mode" : midi.connectFirst();
         if (!offline) {
@@ -436,11 +490,13 @@ int main(int argc, char **argv) {
         std::cout << "Renderer: SDL3 / Skia Ganesh OpenGL\nAudio: " << workspace.backendStatus << '\n'
                   << workspace.midiStatus << '\n';
         if (!recordProbe.empty()) {
-            if (offline || frameLimit < 50) {
-                throw std::runtime_error("Record probe requires native audio and --frames >= 50");
+            if (offline || (!recordSeconds && frameLimit && frameLimit < 50)) {
+                throw std::runtime_error("Record probe requires native audio and either --record-seconds, "
+                                         "automatic completion, or --frames >= 50");
             }
             workspace.action("arm0");
             workspace.action("record");
+            probeStarted = std::chrono::steady_clock::now();
             if (!workspace.recordingAudio) {
                 throw std::runtime_error("Record probe start failed: " + workspace.status);
             }
@@ -598,6 +654,13 @@ int main(int argc, char **argv) {
             if (workspace.monitoring) {
                 recorder.monitor(workspace.selectedTrack(), workspace.selectedInputChannel());
             }
+            workspace.inputStats = input->stats();
+            workspace.recordingQueueHighWater = recorder.queueHighWaterFrames();
+            workspace.recordingLostFrames = recorder.lostFrames();
+            if (workspace.recordingAudio &&
+                (recorder.failed() || recorder.capturedFrames() >= ally::Recorder::maxCaptureFrames)) {
+                workspace.requestRecord();
+            }
             if ((workspace.recordingAudio || workspace.monitoring) && !input->stats().active) {
                 if (workspace.recordingAudio) {
                     workspace.requestRecord();
@@ -694,8 +757,15 @@ int main(int argc, char **argv) {
                 close.window.windowID = SDL_GetWindowID(window.get());
                 SDL_PushEvent(&close);
             }
-            if (!recordProbe.empty() && frames == 35) {
+            if (!recordProbe.empty() && !probeStopped &&
+                (recordSeconds
+                     ? std::chrono::steady_clock::now() - probeStarted >= std::chrono::seconds(recordSeconds)
+                     : frames == 35)) {
                 workspace.action("stop");
+                probeStopped = true;
+            }
+            if (!recordProbe.empty() && probeStopped && !workspace.busy() && !frameLimit) {
+                running = false;
             }
             ++frames;
             if (frameLimit > 0 && frames >= frameLimit) {
@@ -708,13 +778,18 @@ int main(int argc, char **argv) {
             std::cout << "GPU screenshot: " << capture << '\n';
         }
         if (!recordProbe.empty()) {
+            if (recordSeconds && recorder.capturedFrames() < uint64_t(recordSeconds) * 48000 * 9 / 10) {
+                throw std::runtime_error("Native recording stopped before the requested duration");
+            }
             if (workspace.busy() || project.tracks[0].clips.empty() ||
                 !project.tracks[0].clips.back().audio) {
                 throw std::runtime_error("Recording was not imported into the native workspace: " +
                                          workspace.status);
             }
             std::cout << "Native record/import probe: " << recorder.capturedFrames()
-                      << " frames, lost=" << recorder.lostFrames() << '\n';
+                      << " frames, lost=" << recorder.lostFrames()
+                      << ", queue_peak=" << recorder.queueHighWaterFrames()
+                      << ", compensated_start_beat=" << takeStartBeat << '\n';
         }
         input->stop();
         if (workspace.recordingAudio) {
@@ -729,7 +804,9 @@ int main(int argc, char **argv) {
                       << " frames, latency=" << diagnostics.outputLatencyMs
                       << " ms, processed=" << diagnostics.processedFrames
                       << ", xruns=" << diagnostics.underruns
-                      << ", process_max=" << double(diagnostics.maxProcessNs) / 1e6 << " ms\n";
+                      << ", process_max=" << double(diagnostics.maxProcessNs) / 1e6
+                      << " ms, stream_misses=" << engine.streamUnderruns()
+                      << ", PDC=" << engine.latencyFrames() << " frames\n";
         }
         if (autoplay) {
             std::cout << "Observed playback peak: " << observedPeak << '\n';

@@ -195,6 +195,7 @@ class WasapiCapture final : public Capture {
             active_ = true;
             ready->set_value(S_OK);
             HANDLE events[]{stopEvent_, audioEvent_};
+            uint64_t expectedPosition = UINT64_MAX;
             while (active_.load()) {
                 DWORD wait = WaitForMultipleObjects(2, events, FALSE, 2000);
                 if (wait == WAIT_OBJECT_0) {
@@ -209,13 +210,26 @@ class WasapiCapture final : public Capture {
                 while (SUCCEEDED(hr) && packet) {
                     UINT32 count = 0;
                     DWORD flags = 0;
-                    hr = capture->GetBuffer(&data, &count, &flags, nullptr, nullptr);
+                    UINT64 position = 0;
+                    hr = capture->GetBuffer(&data, &count, &flags, &position, nullptr);
                     if (FAILED(hr)) {
                         break;
+                    }
+                    if (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) {
+                        sink.gap(0);
+                    } else if (expectedPosition != UINT64_MAX) {
+                        if (position < expectedPosition) {
+                            sink.gap(0);
+                        } else if (position > expectedPosition) {
+                            sink.gap(position - expectedPosition);
+                        } else if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+                            sink.gap(0);
+                        }
                     }
                     if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
                         xruns_.fetch_add(1);
                     }
+                    expectedPosition = position + count;
                     if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                         std::array<float, 2048> silence{};
                         for (UINT32 at = 0; at < count;) {
@@ -268,8 +282,8 @@ class WasapiCapture final : public Capture {
         }
     }
     BackendStats stats() const noexcept override {
-        return {rate_,         buffer_,       latencyMs_,    frames_.load(),
-                xruns_.load(), maxNs_.load(), error_.load(), active_.load()};
+        return {rate_,         buffer_,        0,         frames_.load(), xruns_.load(), maxNs_.load(),
+                error_.load(), active_.load(), latencyMs_};
     }
 
   private:

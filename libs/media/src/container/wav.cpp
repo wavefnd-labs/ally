@@ -10,13 +10,13 @@
 namespace ally::media {
 namespace {
 constexpr size_t maxBytes = 512 * 1024 * 1024;
-uint32_t read(std::span<const std::byte> b, size_t p, size_t n) {
+uint64_t read(std::span<const std::byte> b, size_t p, size_t n) {
     if (p > b.size() || n > b.size() - p) {
         throw std::runtime_error("Truncated WAV");
     }
-    uint32_t v = 0;
+    uint64_t v = 0;
     for (size_t i = 0; i < n; ++i) {
-        v |= uint32_t(std::to_integer<uint8_t>(b[p + i])) << (8 * i);
+        v |= uint64_t(std::to_integer<uint8_t>(b[p + i])) << (8 * i);
     }
     return v;
 }
@@ -39,15 +39,26 @@ void appendTag(std::vector<std::byte> &b, const char *s) {
 } // namespace
 
 Pcm decodeWav(std::span<const std::byte> b) {
-    if (b.size() > maxBytes || b.size() < 12 || !tag(b, 0, "RIFF") || !tag(b, 8, "WAVE")) {
-        throw std::runtime_error("Expected RIFF/WAVE (RF64 and AIFF are not implemented)");
+    if (b.size() > maxBytes || b.size() < 12 || (!tag(b, 0, "RIFF") && !tag(b, 0, "RF64")) ||
+        !tag(b, 8, "WAVE")) {
+        throw std::runtime_error("Expected RIFF/RF64 WAVE (AIFF is not implemented)");
     }
-    const uint64_t end = uint64_t(read(b, 4, 4)) + 8;
+    const bool rf64 = tag(b, 0, "RF64");
+    uint64_t end = read(b, 4, 4) + 8, dataBytes = 0, sampleCount = 0;
+    if (rf64) {
+        if (b.size() < 48 || read(b, 4, 4) != UINT32_MAX || !tag(b, 12, "ds64") || read(b, 16, 4) < 28 ||
+            read(b, 44, 4) != 0 || read(b, 20, 8) > maxBytes - 8) {
+            throw std::runtime_error("Invalid or unsupported RF64 ds64");
+        }
+        end = read(b, 20, 8) + 8;
+        dataBytes = read(b, 28, 8);
+        sampleCount = read(b, 36, 8);
+    }
     if (end > b.size() || end < 12) {
         throw std::runtime_error("Invalid RIFF size");
     }
     b = b.first(size_t(end));
-    bool haveFmt = false, haveData = false;
+    bool haveFmt = false, haveData = false, haveDs64 = false;
     uint32_t rate = 0, byteRate = 0;
     uint16_t format = 0, channels = 0, bits = 0, align = 0;
     std::span<const std::byte> data;
@@ -55,18 +66,30 @@ Pcm decodeWav(std::span<const std::byte> b) {
         if (b.size() - p < 8) {
             throw std::runtime_error("Truncated chunk header");
         }
-        size_t len = read(b, p + 4, 4);
+        uint64_t length = read(b, p + 4, 4);
+        if (rf64 && tag(b, p, "data") && length == UINT32_MAX) {
+            length = dataBytes;
+        }
+        if (length > b.size() - p - 8) {
+            throw std::runtime_error("Chunk exceeds RF64 bounds");
+        }
+        size_t len = size_t(length);
         if (len > b.size() - p - 8) {
             throw std::runtime_error("Chunk exceeds RIFF bounds");
         }
-        if (tag(b, p, "fmt ")) {
+        if (tag(b, p, "ds64")) {
+            if (!rf64 || haveDs64 || p != 12) {
+                throw std::runtime_error("Invalid ds64 chunk");
+            }
+            haveDs64 = true;
+        } else if (tag(b, p, "fmt ")) {
             if (haveFmt || len < 16) {
                 throw std::runtime_error("Invalid fmt chunk");
             }
             format = uint16_t(read(b, p + 8, 2));
             channels = uint16_t(read(b, p + 10, 2));
-            rate = read(b, p + 12, 4);
-            byteRate = read(b, p + 16, 4);
+            rate = uint32_t(read(b, p + 12, 4));
+            byteRate = uint32_t(read(b, p + 16, 4));
             align = uint16_t(read(b, p + 20, 2));
             bits = uint16_t(read(b, p + 22, 2));
             haveFmt = true;
@@ -92,10 +115,13 @@ Pcm decodeWav(std::span<const std::byte> b) {
     if (align != channels * width || byteRate != uint64_t(rate) * align || data.size() % align) {
         throw std::runtime_error("Invalid PCM alignment or byte rate");
     }
+    if (rf64 && (!haveDs64 || data.size() != dataBytes || data.size() / align != sampleCount)) {
+        throw std::runtime_error("RF64 data size/sample count mismatch");
+    }
     Pcm pcm{rate, channels, {}};
     pcm.samples.resize(data.size() / width);
     for (size_t i = 0; i < pcm.samples.size(); ++i) {
-        uint32_t v = read(data, i * width, width);
+        uint32_t v = uint32_t(read(data, i * width, width));
         float f;
         if (format == 3) {
             f = std::bit_cast<float>(v);
