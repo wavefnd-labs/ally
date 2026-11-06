@@ -1,5 +1,10 @@
 # Ally — DAW 개발 기반
 
+**개발 상태: 2026-11-06부터 무기한 중단.** 오디오 미들웨어 개발은
+[Sona](https://gitlab.com/wave-inc/wave-game/middleware/sona)로 이전했습니다.
+이 저장소의 기존 DAW 코드·디자인·프로젝트 형식은 보존합니다.
+아래 기능과 빌드 설명은 개발 중단 시점의 구현 기록입니다.
+
 C++23으로 만드는 Linux·Windows·macOS 데스크톱 전용 전문 DAW의 첫 구현입니다. 프로젝트 이름은 **Ally**입니다. 프로젝트 오픈소스 라이선스는 미정입니다. 아직 전문 DAW의 전체 기능을 제공하는 제품은 아닙니다.
 
 개발 저장소: [wavefnd-labs/ally](https://github.com/wavefnd-labs/ally). 저장소의 접근 공개 여부와 오픈소스 배포 라이선스는 별도로 관리합니다.

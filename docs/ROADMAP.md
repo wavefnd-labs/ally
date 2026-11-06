@@ -1,5 +1,9 @@
 # Ally 개발 단계
 
+2026-11-06부터 Ally 개발은 무기한 중단합니다. 아래 우선순위는 중단 이전의 계획이며
+자동으로 개발을 이어가지 않습니다. 오디오 미들웨어의 이후 개발 위치는
+[Sona](https://gitlab.com/wave-inc/wave-game/middleware/sona)입니다.
+
 범위는 Linux·Windows·macOS 데스크톱입니다. Studio 04 HTML과 OS 기본 창을 유지합니다. 프로젝트 이름은 Ally이며 배포 라이선스는 미정입니다.
 
 ## 완료한 제작 기반
